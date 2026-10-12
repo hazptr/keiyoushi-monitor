@@ -59,7 +59,7 @@ python3 "$HERE/extract_bundle.py" "$BUNDLE" "$BUNDLE_SHA" /work/bundle
 # The extensions-source checkout is wherever pack-recheck-bundle.sh found it on the GitHub-hosted
 # build job (baked into classpath.txt as absolute paths, rewritten below) — found here by
 # contents, not assumed, so this script doesn't hardcode the build job's workspace layout.
-CPFILE=$(find /work/bundle -path '*/build/ext-run/classpath.txt' 2>/dev/null | head -1)
+CPFILE=$(find /work/bundle -path '*/build/ext-run/classpath.txt' -print -quit 2>/dev/null)
 WT=$(echo "$CPFILE" | sed -E 's#/src/[^/]+/[^/]+/build/ext-run/classpath\.txt$##')
 DIST=/app/runtime-dist
 [ -d "$WT/src" ] || { echo "[entrypoint] couldn't locate the extracted extensions-source checkout" >&2; exit 1; }
@@ -68,7 +68,7 @@ DIST=/app/runtime-dist
 export EXT_RUN_PREBUILT=1
 export EXT_RUN_QUIET=1          # never print raw failure text to the container's own stdout/log
 export EXT_RUN_JAVA_BIN=/opt/jdk21/bin/java
-export EXT_RUN_JAVA_EXTRA_OPTS="-Xmx768m ${JAVA_PROXY_OPTS:-}"
+export EXT_RUN_JAVA_EXTRA_OPTS="-Xmx768m -Djava.awt.headless=true ${JAVA_PROXY_OPTS:-}"
 export EXT_RUN_WV_PROXY=${EXT_RUN_WV_PROXY:-}   # e.g. http://proxy:3128 — see compose.yml
 export EXT_RUN_WV_CHROME_SANDBOX=${EXT_RUN_WV_CHROME_SANDBOX:-0}   # the controller sets 1 when chrome_sandbox is on
 export TZ=${EXT_RUN_TZ:-UTC}

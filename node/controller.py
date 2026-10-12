@@ -441,7 +441,7 @@ def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | No
                                                         # forwarder for, not container-name lookups
            "--read-only",
            "--tmpfs", "/work:rw,size=2g,mode=1777",
-           "--tmpfs", "/tmp:rw,size=512m,mode=1777",
+           "--tmpfs", "/tmp:rw,exec,size=512m,mode=1777",  # exec: the JVM unpacks native libraries here and loads them
            "--tmpfs", "/home:rw,size=1g,mode=1777",
            # The result crosses on stdout (see RESULT_BEGIN/RESULT_END above), not a writable
            # mount — no /output volume, no docker cp, nothing for a runaway write to fill on the

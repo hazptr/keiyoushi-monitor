@@ -253,6 +253,12 @@ another HTTP proxy first, set in the config:
 The proxy's deny rules still apply to every request either way, and nothing about the upstream
 is passed into the sandbox.
 
+### Running several sandboxes at once
+
+`"parallel": N` splits each recheck across N sandboxes running side by side, each with the
+`mem_limit`/`cpus`/`pids_limit` above, so budget N times those. One sandbox gets through roughly
+one extension every two minutes, so a full list of ~300 takes hours at the default of 1.
+
 ### Keeping Cloudflare cookies
 
 `"keep_cookies": true` keeps the `cf_clearance` cookies the sandbox's WebView earns between runs,

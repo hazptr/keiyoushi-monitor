@@ -27,6 +27,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -433,10 +434,10 @@ def tidy_cookie_dir(d: Path) -> None:
 
 
 def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | None = None,
-                cookies: Path | None = None) -> bytes:
+                cookies: Path | None = None, shard: int = 0) -> bytes:
+    """Callers must have run validate_node_image() and verify_image_attestation() on
+    manifest["nodeImage"] first (sandbox_pass() does, once for all its shards)."""
     image = manifest["nodeImage"]  # e.g. ghcr.io/<owner>/<repo>-node@sha256:...
-    validate_node_image(cfg, image)
-    verify_image_attestation(cfg, image)
     port = proxy_port or cfg["proxy_port"]
 
     mem = cfg.get("mem_limit", "1500m")
@@ -494,12 +495,12 @@ def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | No
     if cookies:
         cmd += ["-v", f"{cookies}:/cf:rw", "-e", "EXT_RUN_CF_DIR=/cf"]
     cmd += ["-v", f"{input_dir}:/input:ro",
-            "--name", f"{COMPOSE_PROJECT}-sandbox-run",
+            "--name", f"{COMPOSE_PROJECT}-sandbox-run-{shard}",
             "--",
             image]
     # The app key, any token, the repo, the Pages URL — nothing from `cfg` is ever passed to this container.
     # Only EXT_RUN_WV_PROXY / JAVA_PROXY_OPTS (where to send traffic) cross that boundary.
-    name = f"{COMPOSE_PROJECT}-sandbox-run"
+    name = f"{COMPOSE_PROJECT}-sandbox-run-{shard}"
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)  # stale leftover from a
                                                                         # crashed previous run
     try:
@@ -509,8 +510,6 @@ def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | No
         return extract_marked_json(logs.stdout, MAX_LOG_BYTES)
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-        if cookies:
-            tidy_cookie_dir(cookies)
 
 
 def dispatch_ingest(cfg: dict, payload: dict):
@@ -537,13 +536,44 @@ def dispatch_ingest(cfg: dict, payload: dict):
 
 
 def sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date, proxy_port=None) -> dict:
+    """Runs the extensions in input_dir/recheck.json, split across `parallel` sandboxes (default 1),
+    each with its own input folder and its own slice of the list."""
+    validate_node_image(cfg, manifest["nodeImage"])
+    verify_image_attestation(cfg, manifest["nodeImage"])
     route = "direct" if proxy_port == DIRECT_PORT or not cfg.get("upstream_proxy") else "upstream"
-    payload_bytes = run_sandbox(cfg, manifest, input_dir, proxy_port, cookie_dir(cfg, route))
-    if len(payload_bytes) > MAX_PAYLOAD_BYTES:
-        sys.exit(f"sandbox result is {len(payload_bytes)} bytes, over the {MAX_PAYLOAD_BYTES}-byte cap")
-    validated = validate_node_payload(json.loads(payload_bytes), allowed_ids, run_date=run_date)
-    log(f"validated {len(validated['results'])} row(s) for run {validated['runId']}")
-    return validated
+    cookies = cookie_dir(cfg, route)
+    listed = json.loads((input_dir / "recheck.json").read_text())
+    ids = listed["extensions"]
+    n = max(1, min(int(cfg.get("parallel", 1)), len(ids)))
+    shards = []
+    for i in range(n):
+        d = input_dir.parent / f"{input_dir.name}-{route}-{i}"
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(mode=0o755)
+        (d / "recheck.json").write_text(json.dumps({**listed, "extensions": ids[i::n]}))
+        os.link(input_dir / "bundle.tar.zst", d / "bundle.tar.zst")
+        (d / "recheck.json").chmod(0o444)
+        shards.append((i, d, set(ids[i::n])))
+    log(f"{len(ids)} extension(s) across {n} sandbox(es), {route} route")
+    try:
+        with ThreadPoolExecutor(n) as pool:
+            payloads = list(pool.map(lambda sh: run_sandbox(cfg, manifest, sh[1], proxy_port, cookies, sh[0]), shards))
+    finally:
+        for _, d, _ in shards:
+            shutil.rmtree(d, ignore_errors=True)
+        if cookies:
+            tidy_cookie_dir(cookies)
+    results, run_id = [], None
+    for (_, _, shard_ids), payload_bytes in zip(shards, payloads):
+        if len(payload_bytes) > MAX_PAYLOAD_BYTES:
+            sys.exit(f"sandbox result is {len(payload_bytes)} bytes, over the {MAX_PAYLOAD_BYTES}-byte cap")
+        v = validate_node_payload(json.loads(payload_bytes), shard_ids & allowed_ids, run_date=run_date)
+        if v["runId"] != manifest["runId"]:
+            sys.exit(f"a sandbox reported run {v['runId']}, not {manifest['runId']}; refusing")
+        run_id = v["runId"]
+        results += v["results"]
+    log(f"validated {len(results)} row(s) for run {run_id}")
+    return {**v, "results": results}
 
 
 RUNTIME_PATHS = ("harness/runtime/", "harness/ci/build-runtime.sh")

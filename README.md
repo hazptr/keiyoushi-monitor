@@ -108,7 +108,7 @@ can't recover the handful of sources that only pass from a residential-looking a
 - `site/` — the static page (`index.html`/`app.js`/`style.css`).
 - `untestable-sources.tsv` — sources that can't be smoke-tested at all (self-hosted software like
   Komga/LANraragi) and the reason shown on the page, instead of a failure.
-- `ci-sample.txt` (the `status.yml` `extensions_file` default) / `ci-tiny.txt` — extension-list
+- `ci-sample.txt` (a 100-extension sample for test runs; `status.yml` checks every extension when `extensions_file` is blank) / `ci-tiny.txt` — extension-list
   inputs for test runs.
 
 ## Privacy design

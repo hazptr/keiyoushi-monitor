@@ -184,7 +184,7 @@ jobs:
         run: |
           file="$EXTENSIONS_FILE"
           if [ -z "$file" ]; then
-            find extensions-source/src -mindepth 2 -maxdepth 2 -name build.gradle.kts \
+            find extensions-source/src -mindepth 3 -maxdepth 3 -name build.gradle.kts \
               | while read -r f; do grep -q 'libVersion = "1.6"' "$f" && dirname "$f"; done \
               | sed -E 's#extensions-source/src/##' | sort > ext-list.txt
           else
@@ -196,7 +196,7 @@ jobs:
           n = int('$SHARDS')
           print('shard_indices=' + json.dumps(list(range(n))))
           " >> "$GITHUB_OUTPUT"
-          comm -23 <(find extensions-source/src -mindepth 2 -maxdepth 2 -name build.gradle.kts \
+          comm -23 <(find extensions-source/src -mindepth 3 -maxdepth 3 -name build.gradle.kts \
               | while read -r f; do grep -q 'libVersion = "1.6"' "$f" && dirname "$f"; done \
               | sed -E 's#extensions-source/src/##' | sort) <(sort ext-list.txt) > ext-list.1.6-rest.txt || true
 

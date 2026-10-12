@@ -75,6 +75,7 @@ def merge(status_data: dict, node_payload: dict, run_date: str | None = None) ->
         # "blocked/cloudflare, no step" — a stale step left over from the GitHub-side result would
         # otherwise make a node's "blocked" verdict render as if it failed at that old step.
         x.pop("step", None)
+        tags = x.pop("tags", None)
         if cat == "pass":
             x["status"] = "pass"
             x.pop("error", None)
@@ -83,11 +84,13 @@ def merge(status_data: dict, node_payload: dict, run_date: str | None = None) ->
             x["step"] = row["step"]
             x["error"] = category_text(row)
         elif cat == "blocked":
-            x["status"] = "fail"
+            x["status"] = "maybe"
             x["error"] = category_text(row)
+            x["tags"] = [t for t in (tags or []) if t != "cloudflare"] or ["blocked"]
         elif cat == "cloudflare":
-            x["status"] = "untestable"
+            x["status"] = "maybe"
             x["error"] = category_text(row)
+            x["tags"] = ["cloudflare"]
         x["recheckedOnNode"] = True
         if run_date:
             x["recheckedOn"] = run_date
@@ -103,7 +106,7 @@ def merge(status_data: dict, node_payload: dict, run_date: str | None = None) ->
     if applied:
         status_data["counts"] = {
             s: sum(x["status"] == s for x in status_data.get("extensions", []))
-            for s in ("pass", "partial", "fail", "untestable", "unsupported", "pending")
+            for s in ("pass", "partial", "fail", "maybe", "untestable", "unsupported", "pending")
         }
     status_data["generated"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="minutes")
     print(f"merged {applied} node row(s) of {len(node_payload.get('results', []))} into status.json")

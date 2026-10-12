@@ -37,6 +37,7 @@
       <kbd>/</kbd>
     </div>
     <select id="lang" aria-label="Language"><option value="">All languages</option></select>
+    <select id="tag" aria-label="Why it was turned away" hidden><option value="">Any reason</option></select>
     <select id="content" aria-label="Content">
       <option value="">SFW only</option>
       <option value="all">All content</option>
@@ -55,8 +56,10 @@
       list, loads the newest chapter, then downloads and decodes two pages through the extension’s own
       client. Anything that fails gets one retry before it counts.</p>
     <p><b>Partly working</b> means you can still read, but something else (search, latest updates) fails.
-      <b>Can’t test</b> means we couldn’t get a result at all, usually a Cloudflare challenge the harness
-      can’t solve. The app handles most of those, so check there.</p>
+      <b>Might be broken</b> means the site turned our checker away (Cloudflare, a 403, rate limiting), so
+      it could be the site blocking automated checks or the extension itself. The tag says which. The app
+      gets past most Cloudflare checks, so check there.
+      <b>Can’t test</b> means we couldn’t get a result at all, like a self-hosted source or one that needs an account.</p>
     <p><b>Not checked yet</b> means today’s run hasn’t reached it; the last result is shown instead.
       <b>Not supported</b> means the extension still uses the older 1.4 extension API, which this checker doesn’t run.</p>
     <p><b>Notes</b> are things worth knowing that don’t stop reading, like a source repeating titles in its

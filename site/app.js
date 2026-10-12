@@ -1,6 +1,7 @@
 // Status keys, worst first; this is also the group order. `open`: whether the group starts expanded.
 const STATUS = {
   fail: { label: 'Not working', open: true },
+  maybe: { label: 'Might be broken', open: true },
   partial: { label: 'Partly working', open: true },
   untestable: { label: 'Can’t test', open: true },
   pending: { label: 'Not checked yet', open: false },
@@ -8,8 +9,17 @@ const STATUS = {
   unsupported: { label: 'Not supported', open: false },
 }
 const ORDER = Object.keys(STATUS)
-const BAR_ORDER = ['pass', 'partial', 'fail', 'untestable', 'unsupported', 'pending']
+const BAR_ORDER = ['pass', 'partial', 'fail', 'maybe', 'untestable', 'unsupported', 'pending']
 const LABEL = s => STATUS[s]?.label || s
+// Why a site turned the checker away. Unknown tags still show, as their id.
+const TAGS = {
+  cloudflare: ['Cloudflare', 'Cloudflare blocked our checker'],
+  http403: ['403', 'The site refused our checker (HTTP 403)'],
+  ratelimit: ['Rate limited', 'The site rate limited our checker (HTTP 429)'],
+  blocked: ['Blocked', 'The site refused our checker'],
+}
+const tagLabel = t => TAGS[t]?.[0] || t
+const tagText = t => TAGS[t]?.[1] || `The site turned our checker away (${t})`
 const $ = s => document.querySelector(s)
 const el = (tag, attrs = {}, ...kids) => {
   const e = document.createElement(tag)
@@ -44,8 +54,8 @@ const OPS = {
   read: ['Open a chapter', 'Chapters don’t open'],
   pages: ['Load pages', 'Pages don’t load'],
 }
-const OP_STATUS = { pass: 'Works', fail: 'Fails', skip: 'Not checked', untestable: 'Couldn’t check', na: 'Not applicable' }
-const FROM_CODE = { p: 'pass', a: 'partial', f: 'fail', u: 'untestable', n: 'unsupported' }
+const OP_STATUS = { pass: 'Works', fail: 'Fails', maybe: 'Turned away', skip: 'Not checked', untestable: 'Couldn’t check', na: 'Not applicable' }
+const FROM_CODE = { p: 'pass', a: 'partial', f: 'fail', m: 'maybe', u: 'untestable', n: 'unsupported' }
 const ISSUES = 'https://github.com/keiyoushi/extensions-source/issues'
 
 let DATA = null
@@ -86,6 +96,7 @@ function plain(x) {
     if (failed.length) return failed[0] + (failed.length > 1 ? ` (+${failed.length - 1} more)` : '')
     return x.step ? (OPS[x.step]?.[1] || 'Something in it is broken') : 'Something in it is broken'
   }
+  if (x.status === 'maybe') return x.tags?.length ? tagText(x.tags[0]) : 'The site turned our checker away'
   return x.error || 'Couldn’t check this one automatically'
 }
 
@@ -159,8 +170,8 @@ function report(x) {
   if (x.recheckedOnNode) {
     lines.push(nodeText(x))
   } else {
-    for (const o of x.ops || []) if (o.status === 'fail') lines.push(`${OPS[o.op]?.[0] || o.op}: ${o.error}`)
-    if (!x.ops?.some(o => o.status === 'fail') && x.error) lines.push(x.error)
+    for (const o of x.ops || []) if (['fail', 'maybe'].includes(o.status)) lines.push(`${OPS[o.op]?.[0] || o.op}: ${o.error}`)
+    if (!x.ops?.some(o => ['fail', 'maybe'].includes(o.status)) && x.error) lines.push(x.error)
   }
   lines.push(`Checked ${x.checked ? when(x.checked) : DATA.sweepDate} on main @ ${(DATA.keiCommit || '').slice(0, 10)}`, linkTo(x))
   return lines.join('\n')
@@ -170,6 +181,10 @@ function details(x) {
   const parts = []
   if (x.status === 'pending') {
     parts.push(el('p', { class: 'panel muted' }, 'Today’s run hasn’t reached this one yet. ', plain(x), '.'))
+  }
+  if (x.status === 'maybe') {
+    parts.push(el('p', { class: 'panel muted' }, `${plain(x)}, so we can’t tell if the extension works. `,
+      'Could be the site blocking automated checks, could be the extension. Check in the app.'))
   }
   if (x.recheckedOnNode) {
     // A node's result is never a GitHub-side step failure — it's one fixed category, reported
@@ -183,13 +198,13 @@ function details(x) {
     if (x.recheckedOnNode) parts.push(el('p', { class: 'muted small' }, 'From GitHub’s servers:'))
     parts.push(stepper(x))
     // Steps skipped because an earlier one failed only repeat that failure, so they're left out.
-    const failed = x.ops.some(o => o.status === 'fail')
+    const failed = x.ops.some(o => ['fail', 'maybe'].includes(o.status))
     const notes = x.ops.filter(o => (o.error || o.reason) && !(failed && o.status === 'skip'))
     if (notes.length) {
       parts.push(el('div', { class: 'panel notes' }, ...notes.map(o => el('div', { class: `nitem ${o.status}` },
         el('div', { class: 'nhead' }, el('span', { class: `dot ${dotClass(o.status)}` }), el('b', {}, OPS[o.op]?.[0] || o.op),
           el('span', { class: `opstatus ${o.status}` }, OP_STATUS[o.status] || o.status)),
-        o.status === 'fail' ? el('pre', { class: 'err' }, o.error) : el('p', { class: 'muted' }, o.error || o.reason)))))
+        ['fail', 'maybe'].includes(o.status) ? el('pre', { class: 'err' }, o.error) : el('p', { class: 'muted' }, o.error || o.reason)))))
     }
   } else if (x.error && !x.recheckedOnNode) {
     parts.push(el('p', { class: 'panel' }, x.error))
@@ -209,7 +224,7 @@ function details(x) {
   const issues = el('a', { class: 'btn', href: `${ISSUES}?q=${encodeURIComponent(`is:issue ${x.name}`)}`, target: '_blank', rel: 'noopener' },
     'Search issues ↗')
   parts.push(el('div', { class: 'actions' }, copyButton('Copy link', () => linkTo(x)),
-    ...(['fail', 'partial', 'untestable'].includes(x.status) ? [copyButton('Copy report', () => report(x))] : []), issues))
+    ...(['fail', 'partial', 'maybe', 'untestable'].includes(x.status) ? [copyButton('Copy report', () => report(x))] : []), issues))
   return el('div', { class: 'detail' }, ...parts)
 }
 
@@ -230,6 +245,7 @@ function makeRow(x) {
         el('span', { class: 'top' }, el('span', { class: 'name' }, x.name),
           el('span', { class: 'tag', title: langName(x.lang) }, x.lang),
           ...(nsfw ? [el('span', { class: 'tag nsfw' }, '18+')] : []),
+          ...(x.tags || []).map(t => el('span', { class: 'tag block', title: tagText(t) }, tagLabel(t))),
           ...(x.notes?.length ? [el('span', { class: 'tag note', title: x.notes.join('\n') }, x.notes.length === 1 ? '1 note' : `${x.notes.length} notes`)] : []),
           el('span', { class: 'vh' }, `, ${LABEL(x.status)}`)),
         ...(issue ? [issue] : [])),
@@ -279,13 +295,14 @@ function render(data) {
   const rows = exts.map(x => ({
     x, li: makeRow(x), nsfw: x.contentWarning === 'NSFW',
     name: x.name.toLowerCase(),
-    text: norm(`${x.name} ${x.id} ${x.lang} ${langName(x.lang)} ${plain(x)} ${x.error || ''} ${(x.ops || []).map(o => o.error || '').join(' ')} ${(x.notes || []).join(' ')}`),
+    text: norm(`${x.name} ${x.id} ${x.lang} ${langName(x.lang)} ${plain(x)} ${x.error || ''} ${(x.ops || []).map(o => o.error || '').join(' ')} ${(x.notes || []).join(' ')} ${(x.tags || []).map(tagLabel).join(' ')}`),
   }))
   const rowById = new Map(rows.map(r => [r.x.id, r]))
 
   const params = new URLSearchParams(location.search)
   const state = {
     q: params.get('q') || '', status: STATUS[params.get('status')] ? params.get('status') : '', lang: params.get('lang') || '',
+    tag: params.get('tag') || '',
     content: ['all', 'nsfw'].includes(params.get('content')) ? params.get('content') : '',
     sort: ['name', 'recent'].includes(params.get('sort')) ? params.get('sort') : '',
     allChanges: false, groupOpen: {},
@@ -293,6 +310,12 @@ function render(data) {
   $('#q').value = state.q
   $('#lang').value = state.lang
   $('#content').value = state.content
+  // Reasons are whatever tags this run produced, so a new one needs no page change.
+  const tags = [...new Set(exts.flatMap(x => x.tags || []))].sort((a, b) => tagLabel(a).localeCompare(tagLabel(b)))
+  for (const t of tags) $('#tag').append(el('option', { value: t }, tagLabel(t)))
+  $('#tag').hidden = !tags.length
+  if (!tags.includes(state.tag)) state.tag = ''
+  $('#tag').value = state.tag
   $('#sort').value = state.sort
 
   // Legend buttons are the status filter; the stacked bar above mirrors them and is clickable too.
@@ -341,7 +364,7 @@ function render(data) {
   $('#groups').append(...ORDER.map(s => groups[s].sec), flat)
 
   const contentOk = r => state.content === 'all' || (state.content === 'nsfw' ? r.nsfw : !r.nsfw)
-  const langOk = r => !state.lang || r.x.lang === state.lang
+  const langOk = r => (!state.lang || r.x.lang === state.lang) && (!state.tag || (r.x.tags || []).includes(state.tag))
   const statusOk = r => !state.status || r.x.status === state.status
   const byName = (a, b) => a.name.localeCompare(b.name)
   const recent = (a, b) => (b.x.status !== 'pending' && b.x.since || '').localeCompare(a.x.status !== 'pending' && a.x.since || '') ||
@@ -387,8 +410,8 @@ function render(data) {
       const show = el('a', { href: '#' }, 'Show them')
       show.addEventListener('click', e => {
         e.preventDefault()
-        Object.assign(state, { status: '', lang: '', content: 'all' })
-        $('#lang').value = ''; $('#content').value = 'all'
+        Object.assign(state, { status: '', lang: '', tag: '', content: 'all' })
+        $('#lang').value = ''; $('#tag').value = ''; $('#content').value = 'all'
         apply()
       })
       hint.replaceChildren(`${num(hidden)} more match “${state.q.trim()}” but your filters hide ${hidden === 1 ? 'it' : 'them'}. `, show)
@@ -396,7 +419,7 @@ function render(data) {
     const empty = $('#empty')
     empty.hidden = shown.length > 0 || hidden > 0
     empty.textContent = words.length ? `No extension matches “${state.q.trim()}”.` : 'Nothing matches that.'
-    const p = new URLSearchParams(['q', 'status', 'lang', 'content', 'sort'].filter(k => state[k]).map(k => [k, state[k]]))
+    const p = new URLSearchParams(['q', 'status', 'lang', 'tag', 'content', 'sort'].filter(k => state[k]).map(k => [k, state[k]]))
     history.replaceState(null, '', (p.size ? `?${p}` : location.pathname) + location.hash)
   }
 
@@ -406,11 +429,11 @@ function render(data) {
     const r = rowById.get(decodeURIComponent(location.hash.slice(1)))
     if (!r) return
     if (!contentOk(r)) state.content = 'all'
-    if (!langOk(r)) state.lang = ''
+    if (!langOk(r)) { state.lang = ''; state.tag = '' }
     if (!statusOk(r)) state.status = ''
     if (!norm(state.q).split(' ').filter(Boolean).every(w => r.text.includes(w))) state.q = ''
     state.groupOpen[r.x.status] = true
-    $('#q').value = state.q; $('#lang').value = state.lang; $('#content').value = state.content
+    $('#q').value = state.q; $('#lang').value = state.lang; $('#tag').value = state.tag; $('#content').value = state.content
     apply()
     const det = r.li.querySelector('details')
     det.open = true
@@ -423,6 +446,7 @@ function render(data) {
   $('#cmore').addEventListener('click', () => { state.allChanges = !state.allChanges; apply() })
   $('#q').addEventListener('input', e => { state.q = e.target.value; apply() })
   $('#lang').addEventListener('change', e => { state.lang = e.target.value; apply() })
+  $('#tag').addEventListener('change', e => { state.tag = e.target.value; apply() })
   $('#content').addEventListener('change', e => { state.content = e.target.value; apply() })
   $('#sort').addEventListener('change', e => { state.sort = e.target.value; apply() })
   document.addEventListener('keydown', e => {

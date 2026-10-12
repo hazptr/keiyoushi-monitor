@@ -4,6 +4,8 @@ A self-hostable daily health check for [keiyoushi](https://github.com/keiyoushi/
 1.6 extensions, running entirely on GitHub Actions, with an optional recheck node for the slice
 of sources that block datacenter IPs outright.
 
+Live page: https://hazptr.github.io/keiyoushi-monitor/
+
 Each extension runs on a JVM harness that stands in for the Mihon/Komikku app: a real
 implementation of the extensions-lib 1.6 API plus Mihon's network stack, driving a real headed
 Chrome WebView (so Cloudflare sees a normal browser). It loads popular, opens a title and its

@@ -31,16 +31,27 @@ UNTESTABLE_RULES = [
      "Self-hosted, needs your own server to test"),
     (re.compile(r"NoClassDefFoundError|NoSuchMethodError|NoSuchFieldError|NoSuchAlgorithmException|ext-run: the source uses an Android class|isn't supported in the harness|postUrl", re.I),
      "Our tester can't run this one yet, a gap on our side"),
-    (re.compile(r"WebViewTimeoutException|Timed out waiting for WebView|turnstile|Failed to bypass Cloudflare", re.I),
-     "Cloudflare check our tester can't get through"),
     (re.compile(r"\b(log ?in|sign ?in|session expired|credentials|username or password|refresh token)\b|\bwebview\b", re.I),
      "Needs an account or a WebView step in the app"),
+]
+
+# The site turned the checker away, so we can't tell if the extension works: "Might be broken",
+# tagged with why. Checked before UNTESTABLE_RULES ("waiting for WebView" would match its login rule).
+BLOCK_TAGS = [
+    ("cloudflare", re.compile(r"WebViewTimeoutException|Timed out waiting for WebView|turnstile|Failed to bypass Cloudflare|cloudflare|cf-mitigated", re.I)),
+    ("http403", re.compile(r"HTTP error 403\b")),
+    ("ratelimit", re.compile(r"HTTP error 429\b")),
 ]
 
 OPS = ["browse", "latest", "search", "details", "chapters", "read", "pages"]
 LEGACY_STEPS = {"popular": "browse", "manga": "details", "pages": "read", "images": "pages"}
 RUNS_KEPT = 90
-CODES = {"pass": "p", "partial": "a", "fail": "f", "untestable": "u", "unsupported": "n"}
+CODES = {"pass": "p", "partial": "a", "fail": "f", "maybe": "m", "untestable": "u", "unsupported": "n"}
+STATUSES = ("pass", "partial", "fail", "maybe", "untestable", "unsupported", "pending")
+
+
+def block_tags(text: str) -> list:
+    return [tag for tag, rx in BLOCK_TAGS if rx.search(text or "")]
 
 
 def untestable_reason(summary: str):
@@ -82,8 +93,13 @@ def operations(smoke, cfg: dict | None = None) -> list:
         status = st.get("status") or ("pass" if st.get("ok") else "fail")
         item = {"op": op, "status": status}
         if status == "fail":
-            reason = untestable_reason(st.get("error") or "")
-            item.update(status="untestable", error=reason) if reason else item.update(error=short_error(st.get("error")) or "failed")
+            tags, reason = block_tags(st.get("error")), untestable_reason(st.get("error") or "")
+            if tags:
+                item.update(status="maybe", error=short_error(st.get("error")) or "blocked", tags=tags)
+            elif reason:
+                item.update(status="untestable", error=reason)
+            else:
+                item.update(error=short_error(st.get("error")) or "failed")
         elif status == "skip" and st.get("reason"):
             item["reason"] = scrub_text(st["reason"])[:160]
         if op in (cfg or {}).get("not_applicable", []) and item["status"] != "pass":
@@ -97,6 +113,8 @@ def overall(ops: list) -> str:
     fails = [o for o in ops if o["status"] == "fail"]
     reading = by.get("read") == "pass" and by.get("pages") == "pass"
     if not fails:
+        if any(o["status"] == "maybe" for o in ops):
+            return "maybe"
         return "pass" if reading or not ops else "untestable"
     return "partial" if reading else "fail"
 
@@ -166,6 +184,8 @@ def entry(ext_source_dir, json_dir, config_dir, ext: str, status: str, summary: 
             pub.update(step=first["op"], error=first["error"])
     elif status == "pass":
         pub["status"] = "pass"
+    elif status == "fail" and block_tags(summary) and not any(o["status"] == "fail" for o in ops):
+        pub.update(status="maybe", error=short_error(summary) or "blocked")
     elif status == "fail" and untestable_reason(summary):
         pub.update(status="untestable", error=untestable_reason(summary))
     elif status == "fail":
@@ -176,6 +196,9 @@ def entry(ext_source_dir, json_dir, config_dir, ext: str, status: str, summary: 
                 o.update(status="untestable", error=scrub_text(summary)[:160] if summary else "Couldn't check")
         reason = (scrub_text(summary)[:160] if status == "untestable" and summary else "Build or harness error, not the extension's fault")
         pub.update(status="untestable", error=reason)
+    if pub["status"] == "maybe":
+        tags = {t for o in ops for t in o.get("tags", [])} | set(block_tags(summary))
+        pub["tags"] = [t for t, _ in BLOCK_TAGS if t in tags]
     return pub
 
 
@@ -245,7 +268,7 @@ def build(args) -> dict:
     for x in exts:
         x["name"] = scrub_text(x.get("name", ""))
     exts.sort(key=lambda x: (x["lang"], x.get("name", "").lower()))
-    counts = {s: sum(x["status"] == s for x in exts) for s in ("pass", "partial", "fail", "untestable", "unsupported", "pending")}
+    counts = {s: sum(x["status"] == s for x in exts) for s in STATUSES}
 
     runs = (prev or {}).get("history", {}).get("runs", [])
     ext_hist = (prev or {}).get("history", {}).get("ext", {})

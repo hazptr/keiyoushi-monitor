@@ -1,0 +1,45 @@
+keiyoushi-monitor
+Copyright the keiyoushi-monitor contributors.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project builds and runs extensions from keiyoushi/extensions-source
+(https://github.com/keiyoushi/extensions-source) as its subject under test. keiyoushi-monitor is
+not affiliated with, and is not endorsed by, the keiyoushi project.
+
+Some checks are adapted from vetleledaal/keiyoushi-status
+(https://github.com/vetleledaal/keiyoushi-status), used with permission.
+
+== Mihon-derived files ==
+
+The JVM harness at harness/runtime/ stands in for the Mihon/Komikku app so that a keiyoushi
+extension can run and be smoke-tested outside the app. Some files under
+harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/ are ported, with only ext-run-specific
+changes (each marked "ext-run:" in the file itself), from Mihon
+(https://github.com/mihonapp/mihon), licensed Apache License, Version 2.0. Each such file carries
+its own header naming the exact upstream path and commit it was ported from. As of this writing,
+those files are:
+
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/AndroidCookieJar.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkPreferences.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/OkHttpExtensions.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CloudflareInterceptor.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/UncaughtExceptionInterceptor.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/UserAgentInterceptor.kt
+  harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/WebViewInterceptor.kt
+
+Copyright the Mihon Open Source Project and the Tachiyomi Open Source Project, licensed under the
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+Other files under harness/runtime/src/main/kotlin/eu/kanade/tachiyomi/ and
+harness/runtime/src/main/kotlin/android/, androidx/, and app/cash/quickjs/ are NOT derived from
+Mihon's code. They are stand-ins written from scratch for this project, matching the shape of
+the Android SDK classes (android.*, androidx.*), the extensions-lib API surface that an
+extension itself targets (eu.kanade.tachiyomi.source.*, network.Requests,
+network.JavaScriptEngine, network.HttpException), and the Cash App QuickJS JVM binding
+(app.cash.quickjs) that the harness runs in-process instead of on a device — enough of their
+public surface to let a real, unmodified extension's own code run and compile against it, not a
+reimplementation of any Mihon or Android internals.
+
+Files under harness/runtime/src/main/kotlin/keiyoushi/extrun/ are original to this project.

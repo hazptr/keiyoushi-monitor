@@ -1,0 +1,3 @@
+en/webnex
+id/komikzoid
+all/webtoons

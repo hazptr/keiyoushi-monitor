@@ -1,0 +1,7 @@
+# lang/name	reason shown on the status page (skipped in the sweep, listed as untestable)
+all/komga	Self-hosted, needs your own server to test
+all/lanraragi	Self-hosted, needs your own server to test
+all/mango	Self-hosted, needs your own server to test
+all/stashapp	Self-hosted, needs your own server to test
+all/foolslidecustomizable	Self-hosted, needs your own server to test
+en/bakkinselfhosted	Self-hosted, needs your own server to test

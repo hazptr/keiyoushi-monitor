@@ -1,0 +1,15 @@
+harness/ci/__pycache__
+publisher/__pycache__
+__pycache__/
+*.pyc
+out/
+.DS_Store
+node/controller.config.toml
+node/controller.config.json
+node/.last_run_id
+node/.controller.lock
+node/controller.log
+node/runtime-dist/
+node/RUNTIME_COMMIT
+node/*.pat
+node/proxy/own-ip.generated.conf

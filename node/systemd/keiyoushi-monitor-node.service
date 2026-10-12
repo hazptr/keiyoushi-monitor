@@ -1,0 +1,8 @@
+[Unit]
+Description=keiyoushi-monitor recheck node: one poll-and-run pass
+# Requires your user's docker group membership; no root needed for this unit itself.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/keiyoushi-monitor
+ExecStart=/usr/bin/python3 node/controller.py --config node/controller.config.json

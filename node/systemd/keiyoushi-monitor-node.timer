@@ -1,0 +1,16 @@
+[Unit]
+Description=Poll keiyoushi-monitor's recheck.json on a schedule
+
+[Timer]
+OnCalendar=*-*-* *:7/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+# Install (user units, no root):
+#   mkdir -p ~/.config/systemd/user
+#   cp keiyoushi-monitor-node.service keiyoushi-monitor-node.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now keiyoushi-monitor-node.timer
+#   loginctl enable-linger "$USER"   # so the timer still fires when you're logged out

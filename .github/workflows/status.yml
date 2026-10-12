@@ -1,0 +1,548 @@
+name: status
+
+# No pull_request / pull_request_target triggers anywhere in this workflow or repo, and no
+# self-hosted runner anywhere either — see node/README.md for how the optional recheck actually
+# works (a poll-based node, never a runner GitHub pushes jobs to).
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      extensions_file:
+        description: "Path (in this repo) to the lang/name list to check; blank = every 1.6 extension"
+        default: ci-sample.txt
+      extensions_source_ref:
+        description: "keiyoushi/extensions-source ref/SHA to pin to; blank = main HEAD"
+        default: ""
+      shards:
+        description: "Number of parallel shards"
+        default: "20"
+      publish:
+        description: "Deploy the site (true/false); schedule runs always publish"
+        default: "false"
+
+env:
+  EXTENSIONS_SOURCE_REPO: keiyoushi/extensions-source
+  ANDROID_JAVA_VERSION: "17"
+  RUNTIME_JAVA_VERSION: "21"
+  RECHECK_MAX_DEFAULT: "300"
+
+permissions:
+  contents: read   # publish escalates to write for itself only, below
+
+jobs:
+  selftest:
+    # Cheap, dependency-free scrub/leak-check assertions. Gates publish (via needs:) — a red
+    # selftest means status.json/recheck.json never get published off whatever this run produced.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: python3 publisher/test_scrub.py
+
+  validate-inputs:
+    # All workflow_dispatch inputs validated in one place, early, via env: (never a GH expression spliced directly into shell text, inside a
+    # run: string). Everything downstream reads the already-validated values from this job's
+    # outputs, not from github.event.inputs directly.
+    runs-on: ubuntu-latest
+    outputs:
+      extensions_file: ${{ steps.v.outputs.extensions_file }}
+      shards: ${{ steps.v.outputs.shards }}
+      ref_input: ${{ steps.v.outputs.ref_input }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - id: v
+        env:
+          EXTENSIONS_FILE: ${{ github.event.inputs.extensions_file }}
+          SHARDS: ${{ github.event.inputs.shards }}
+          REF_INPUT: ${{ github.event.inputs.extensions_source_ref }}
+          PUBLISH_INPUT: ${{ github.event.inputs.publish }}
+        run: |
+          # Blank is meaningful (a schedule run's inputs are always empty): it means "every 1.6
+          # extension", handled downstream in the `build` job's "pick extension list" step. Only
+          # validate the regex when a value was actually given.
+          file="${EXTENSIONS_FILE:-}"
+          if [ -n "$file" ]; then
+            # bash's [[ =~ ]] uses POSIX ERE, which has no \w — spelled out instead.
+            [[ "$file" =~ ^[A-Za-z0-9._-]+\.txt$ ]] || { echo "::error::extensions_file '$file' doesn't match ^[A-Za-z0-9._-]+\\.txt\$"; exit 1; }
+          fi
+          echo "extensions_file=$file" >> "$GITHUB_OUTPUT"
+
+          shards="${SHARDS:-20}"
+          [[ "$shards" =~ ^[0-9]{1,2}$ ]] || { echo "::error::shards '$shards' doesn't match ^[0-9]{1,2}\$"; exit 1; }
+          [ "$shards" -ge 1 ] || { echo "::error::shards must be >= 1, got '$shards'"; exit 1; }
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
+          ref="${REF_INPUT:-}"
+          if [ -n "$ref" ] && ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && ! [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$ ]]; then
+            echo "::error::extensions_source_ref '$ref' is neither a 40-hex SHA nor a plausible branch name"; exit 1
+          fi
+          echo "ref_input=$ref" >> "$GITHUB_OUTPUT"
+
+          pub="${PUBLISH_INPUT:-false}"
+          [[ "$pub" == "true" || "$pub" == "false" ]] || { echo "::error::publish '$pub' must be true/false"; exit 1; }
+          echo "publish=$pub" >> "$GITHUB_OUTPUT"
+
+  build-runtime:
+    # The harness runtime (the app stand-in) never runs extension code — it's built in its own
+    # job, with its own cache key, so a compromised/weird extensions-source checkout can never
+    # poison the cache the runtime build reads from.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.RUNTIME_JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@d156388eb19639ec20ade50009f3d199ce1e2808 # v4.1.0
+        with:
+          cache-read-only: false
+          # S12: gradle/actions/setup-gradle v4 has no `cache-prefix`/explicit-namespace input
+          # (tried it; the action rejects it as an unknown input) — it namespaces cache keys by
+          # job name automatically instead, confirmed against this repo's real cache keys: this
+          # job's own ("...|runtime[hash]-...") never collides with the extension-build job's
+          # ("...|build[hash]-..."), so no extra configuration is needed here for that guarantee.
+      - run: harness/ci/build-runtime.sh harness/runtime dist
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: runtime-dist
+          path: dist/
+
+  build:
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    outputs:
+      kei_commit: ${{ steps.pin.outputs.sha }}
+      shard_indices: ${{ steps.plan.outputs.shard_indices }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: proto
+          persist-credentials: false
+      - id: pin
+        name: resolve and verify the extensions-source ref
+        env:
+          REF_INPUT: ${{ needs.validate-inputs.outputs.ref_input }}
+        run: |
+          ref="$REF_INPUT"
+          if [ -z "$ref" ]; then
+            # The common case (no ref pinned): resolve main's own current tip. Trivially its own
+            # ancestor — no verification call needed.
+            sha=$(git ls-remote "https://github.com/${EXTENSIONS_SOURCE_REPO}.git" main | cut -f1)
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::couldn't resolve ${EXTENSIONS_SOURCE_REPO}'s main"; exit 1; }
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sha=$(git ls-remote "https://github.com/${EXTENSIONS_SOURCE_REPO}.git" "$ref" | cut -f1)
+          [ -n "$sha" ] || sha=$ref  # already a SHA
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::'$ref' did not resolve to a 40-hex SHA"; exit 1; }
+          # The resolved commit must actually exist in keiyoushi/extensions-source AND be an
+          # ancestor of its main branch — this is what stops a fork-network commit (e.g. someone
+          # else's open PR branch, which also lives in GitHub's object graph but never merges
+          # into upstream main) from ever being checked out and built here, even if it somehow
+          # got passed in as extensions_source_ref. Uses the compare API (status "identical" or
+          # "behind" main means $sha IS an ancestor) instead of a local clone/fetch — cheap, no
+          # need to pull a full history of a large repo just to check one ancestry relationship.
+          status=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${EXTENSIONS_SOURCE_REPO}/compare/${sha}...main" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
+          case "$status" in
+            identical|behind) ;;
+            *) echo "::error::$sha is not an ancestor of ${EXTENSIONS_SOURCE_REPO}'s main branch (compare status: '$status')"; exit 1 ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.EXTENSIONS_SOURCE_REPO }}
+          ref: ${{ steps.pin.outputs.sha }}
+          fetch-depth: 1
+          path: extensions-source
+          persist-credentials: false
+      - uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
+        with:
+          distribution: temurin
+          java-version: |
+            ${{ env.ANDROID_JAVA_VERSION }}
+            ${{ env.RUNTIME_JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@d156388eb19639ec20ade50009f3d199ce1e2808 # v4.1.0
+        with:
+          # Keyed by the kei commit: the extension-build cache from one keiyoushi commit never
+          # bleeds into a build at a different commit, and (unlike build-runtime's cache) this
+          # one never writes back from a run that executed extension code against the network —
+          # read-only, refreshed only by this same job key.
+          cache-read-only: true
+          gradle-home-cache-cleanup: false
+
+      - name: pick extension list
+        id: plan
+        env:
+          EXTENSIONS_FILE: ${{ needs.validate-inputs.outputs.extensions_file }}
+          SHARDS: ${{ needs.validate-inputs.outputs.shards }}
+        run: |
+          file="$EXTENSIONS_FILE"
+          if [ -z "$file" ]; then
+            find extensions-source/src -mindepth 2 -maxdepth 2 -name build.gradle.kts \
+              | while read -r f; do grep -q 'libVersion = "1.6"' "$f" && dirname "$f"; done \
+              | sed -E 's#extensions-source/src/##' | sort > ext-list.txt
+          else
+            grep -vE '^\s*(#|$)' "proto/$file" > ext-list.txt
+          fi
+          python3 proto/harness/ci/split.py ext-list.txt "$SHARDS" shards
+          python3 -c "
+          import json
+          n = int('$SHARDS')
+          print('shard_indices=' + json.dumps(list(range(n))))
+          " >> "$GITHUB_OUTPUT"
+          comm -23 <(find extensions-source/src -mindepth 2 -maxdepth 2 -name build.gradle.kts \
+              | while read -r f; do grep -q 'libVersion = "1.6"' "$f" && dirname "$f"; done \
+              | sed -E 's#extensions-source/src/##' | sort) <(sort ext-list.txt) > ext-list.1.6-rest.txt || true
+
+      - name: build extensions
+        env:
+          EXT_RUN_GRADLE_JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
+        run: proto/harness/ci/build-all.sh extensions-source ext-list.txt build.tar.zst
+
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: shards
+          path: shards/
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: extensions-build
+          path: build.tar.zst
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: ext-lists
+          path: |
+            ext-list.txt
+            ext-list.1.6-rest.txt
+
+  sweep:
+    needs: [build, build-runtime]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shard_indices) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: proto
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.EXTENSIONS_SOURCE_REPO }}
+          ref: ${{ needs.build.outputs.kei_commit }}
+          fetch-depth: 1
+          path: extensions-source
+          persist-credentials: false
+      - uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
+        with:
+          distribution: temurin
+          java-version: |
+            ${{ env.ANDROID_JAVA_VERSION }}
+            ${{ env.RUNTIME_JAVA_VERSION }}
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: runtime-dist
+          path: dist
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: shards
+          path: shards
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: extensions-build
+          path: .
+      - name: extract prebuilt extensions
+        run: |
+          sudo apt-get install -y -qq zstd >/dev/null || true
+          proto/harness/ci/extract-build.sh build.tar.zst extensions-source
+      - name: smoke shard ${{ matrix.shard }}
+        env:
+          EXT_RUN_JAVA_BIN: ${{ env.JAVA_HOME_21_X64 }}/bin/java
+          EXT_RUN_PREBUILT: "1"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          chmod +x proto/harness/ci/*.sh
+          proto/harness/ci/run-shard.sh extensions-source dist "shards/shard-${SHARD}.txt" "out"
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}-results
+          path: out/
+
+  classify:
+    needs: sweep
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      has_recheck: ${{ steps.recheck.outputs.has_recheck }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: proto
+          persist-credentials: false
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: shard-*-results
+          path: shard-results
+      - name: merge results.tsv and json
+        run: |
+          shopt -s nullglob
+          printf 'ext\tstatus\tsecs\tsummary\tvia\n' > results.tsv
+          mkdir -p merged/json
+          for d in shard-results/shard-*-results; do
+            [ -f "$d/results.tsv" ] && tail -n +2 "$d/results.tsv" >> results.tsv
+            [ -d "$d/json" ] && cp "$d"/json/*.json merged/json/ 2>/dev/null || true
+          done
+          cp results.tsv merged/
+      - id: recheck
+        name: decide which failures could use a node recheck
+        env:
+          RECHECK_MAX: ${{ vars.RECHECK_MAX_EXTENSIONS }}
+        run: |
+          python3 proto/publisher/needs_recheck.py results.tsv recheck-list.txt "${RECHECK_MAX:-$RECHECK_MAX_DEFAULT}"
+          if [ -s recheck-list.txt ]; then echo "has_recheck=1" >> "$GITHUB_OUTPUT"; else echo "has_recheck=0" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: merged-results
+          path: merged/
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: recheck-list
+          path: recheck-list.txt
+
+  # NO job that holds `contents: write` ever extracts or runs anything an
+  # earlier job produced. `build-site` does all the extraction/execution (extract-build.sh,
+  # pack-recheck-bundle.sh, build_status.py) with read-only permissions and uploads finished
+  # artifacts; `deploy` below only downloads those artifacts (actions/download-artifact, which
+  # just unzips — it never shells out to anything inside them) and pushes them on. No repo script
+  # in `deploy` ever touches an artifact's contents; the Release-asset upload treats the bundle as
+  # an opaque blob (the bundle itself is never committed to gh-pages).
+  build-site:
+    needs: [selftest, validate-inputs, build, classify]
+    runs-on: ubuntu-latest
+    if: always() && needs.selftest.result == 'success' && needs.build.result == 'success' && needs.classify.result == 'success'
+    permissions:
+      contents: read
+      packages: read   # only to `docker buildx imagetools inspect` the already-published node
+                        # image below (read its digest + a label) — never write, never run it.
+    outputs:
+      has_bundle: ${{ steps.recheck.outputs.has_bundle }}
+      bundle_file: ${{ steps.recheck.outputs.bundle_file }}
+    env:
+      RECHECK_MAX: ${{ vars.RECHECK_MAX_EXTENSIONS }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: proto
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.EXTENSIONS_SOURCE_REPO }}
+          ref: ${{ needs.build.outputs.kei_commit }}
+          fetch-depth: 1
+          path: extensions-source
+          persist-credentials: false
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: merged-results
+          path: merged
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: recheck-list
+          path: .
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: extensions-build
+          path: .
+
+      # Read-only checkout of gh-pages: the history source (previous status.json and the
+      # previously-published recheck.json), read via the checkout action rather than the raw CDN
+      # (which can lag or serve a cached-stale copy) — this job never pushes to this branch, only
+      # `deploy` does, from its own download of this job's finished artifact.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: gh-pages
+          fetch-depth: 1
+          persist-credentials: false
+      - name: snapshot the currently-published status/recheck assets (or start empty on the very first run)
+        run: |
+          mkdir -p gh-pages
+          [ -s gh-pages/status.json ] && cp gh-pages/status.json previous-status.json || echo "{}" > previous-status.json
+          [ -s gh-pages/recheck.json ] && cp gh-pages/recheck.json previous-recheck.json || true
+
+      - name: build status.json + site
+        env:
+          KEI_COMMIT: ${{ needs.build.outputs.kei_commit }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 proto/publisher/build_status.py \
+            --results merged/results.tsv \
+            --extensions-source extensions-source \
+            --site proto/site \
+            --out public \
+            --overrides proto/untestable-sources.tsv \
+            --previous-status previous-status.json \
+            --kei-commit "$KEI_COMMIT" \
+            --run-id "$RUN_ID"
+
+      # Resolve the node image's digest (and the commit its baked-in runtime was built from)
+      # live, from the registry, instead of trusting a `node/IMAGE_DIGEST` file this workflow
+      # used to auto-commit to `main` on every push. If GHCR has no `:latest` tag yet (no
+      # node-image build has ever run), this simply reports no image and the run falls back to
+      # "no recheck available yet" below, same as before.
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - id: node_image
+        name: resolve the published node image's digest + runtime commit
+        env:
+          OWNER_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+          repo = os.environ["OWNER_REPO"]
+          ref = f"ghcr.io/{repo}-node:latest"
+          out = subprocess.run(["docker", "buildx", "imagetools", "inspect", ref, "--format", "{{json .}}"],
+                                capture_output=True, text=True)
+          gh_out = os.environ["GITHUB_OUTPUT"]
+          if out.returncode != 0:
+              print(f"no published node image yet ({out.stderr.strip()[:200]})", file=sys.stderr)
+              open(gh_out, "a").write("image=\nruntime_commit=\n")
+              sys.exit(0)
+          data = json.loads(out.stdout)
+          digest = data["manifest"]["digest"]
+          image = data.get("image") or {}
+          # Single-platform builds may report `image` keyed by platform (like a multi-arch index)
+          # or as the config directly, depending on buildx version; handle either shape.
+          cfg = image.get("config") if "config" in image else next(iter(image.values()), {}).get("config", {})
+          commit = (cfg or {}).get("Labels", {}).get("org.opencontainers.image.revision", "")
+          with open(gh_out, "a") as f:
+              f.write(f"image=ghcr.io/{repo}-node@{digest}\n")
+              f.write(f"runtime_commit={commit}\n")
+          PYEOF
+
+      - name: build the recheck.json + bundle for a polling node (or carry the previous recheck.json forward)
+        id: recheck
+        env:
+          NODE_IMAGE: ${{ steps.node_image.outputs.image }}
+          RUNTIME_COMMIT: ${{ steps.node_image.outputs.runtime_commit }}
+          HAS_RECHECK: ${{ needs.classify.outputs.has_recheck }}
+          OWNER_REPO: ${{ github.repository }}
+          KEI_COMMIT: ${{ needs.build.outputs.kei_commit }}
+          RUN_ID: ${{ github.run_id }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          image="$NODE_IMAGE"
+          # Not an error: node-image.yml only rebuilds on pushes that touch harness/node paths,
+          # so the published image's baked-in runtime commit can legitimately lag this run's own
+          # commit by any amount. Surfaced as a visible warning rather than silently assumed —
+          # a node polling right now runs whatever runtime that older commit built, not this one.
+          if [ -n "$RUNTIME_COMMIT" ] && [ "$RUNTIME_COMMIT" != "$CURRENT_SHA" ]; then
+            echo "::warning::published node image's harness runtime was built from $RUNTIME_COMMIT, this run is $CURRENT_SHA — a node polling now runs the older runtime until node-image.yml rebuilds"
+          fi
+          if [ "$HAS_RECHECK" = "1" ] && [[ "$image" == ghcr.io/*@sha256:* ]] && [ -n "$RUNTIME_COMMIT" ]; then
+            sudo apt-get install -y -qq zstd >/dev/null || true
+            proto/harness/ci/extract-build.sh build.tar.zst extensions-source
+            head -n "${RECHECK_MAX:-$RECHECK_MAX_DEFAULT}" recheck-list.txt > recheck-subset.txt
+            # Per-run asset name (not one fixed filename `--clobber`'d every run): a node mid-
+            # download when a new run republishes would otherwise get bytes that don't match the
+            # checksum recheck.json already committed it to, or a corrupt file replaced out from
+            # under it — a uniquely-named asset for this run's bundle can't be overwritten by a
+            # later run. `deploy` below prunes old ones instead, so the release doesn't grow
+            # without bound.
+            bundle_file="recheck-bundle-${RUN_ID}.tar.zst"
+            proto/harness/ci/pack-recheck-bundle.sh extensions-source recheck-subset.txt "$bundle_file"
+            size=$(stat -c%s "$bundle_file")
+            sha=$(sha256sum "$bundle_file" | cut -d' ' -f1)
+            # Deterministic GitHub Release asset URL for this run's bundle filename under the
+            # fixed rolling "recheck-bundle" tag `deploy` publishes to below (the bundle itself
+            # never lives on gh-pages) — computable here without the deploy job having run first.
+            url="https://github.com/${OWNER_REPO}/releases/download/recheck-bundle/${bundle_file}"
+            python3 proto/publisher/write_recheck_manifest.py recheck-subset.txt \
+              "$KEI_COMMIT" "$RUN_ID" "$image" \
+              "$sha" "$size" "$url" "$RUNTIME_COMMIT" \
+              public/recheck.json "${RECHECK_MAX:-$RECHECK_MAX_DEFAULT}"
+            mkdir -p bundle-out && mv "$bundle_file" bundle-out/
+            echo "bundle_file=$bundle_file" >> "$GITHUB_OUTPUT"
+            echo "has_bundle=1" >> "$GITHUB_OUTPUT"
+          elif [ -s previous-recheck.json ]; then
+            echo "no (new) recheck needed this run; carrying the previous recheck.json forward unchanged (its bundle Release asset is untouched)"
+            cp previous-recheck.json public/recheck.json
+            echo "has_bundle=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "no recheck available yet (no node image published, or nothing to recheck) — skipping recheck.json"
+            echo "has_bundle=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: site-preview
+          path: public/
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: steps.recheck.outputs.has_bundle == '1'
+        with:
+          name: recheck-bundle
+          path: bundle-out/${{ steps.recheck.outputs.bundle_file }}
+
+  deploy:
+    needs: [validate-inputs, build-site]
+    runs-on: ubuntu-latest
+    if: always() && needs.build-site.result == 'success' && (github.event_name == 'schedule' || needs.validate-inputs.outputs.publish == 'true')
+    concurrency:
+      group: gh-pages-publish   # shared with ingest.yml's deploy job: never race a gh-pages push
+    permissions:
+      contents: write   # the ONLY job in this workflow that can push, and it never runs a repo
+                         # script against the artifacts' contents below — just download + push/
+                         # upload the opaque bundle blob.
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: site-preview
+          path: public
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        if: needs.build-site.outputs.has_bundle == '1'
+        with:
+          name: recheck-bundle
+          path: bundle-out
+      - name: publish the recheck bundle as a per-run Release asset, then prune old ones
+        if: needs.build-site.outputs.has_bundle == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER_REPO: ${{ github.repository }}
+          BUNDLE_FILE: ${{ needs.build-site.outputs.bundle_file }}
+        run: |
+          gh release view recheck-bundle --repo "$OWNER_REPO" >/dev/null 2>&1 || \
+            gh release create recheck-bundle --repo "$OWNER_REPO" \
+              --title "Recheck bundle (rolling)" \
+              --notes "Prebuilt classes for recent recheck subsets, one asset per run. referenced by URL+sha256 from recheck.json, never by tag/version. Old assets are pruned, not overwritten in place, so a node mid-download never sees a file swapped out from under it."
+          # Per-run asset name, not --clobber over one fixed name — see build-site's comment on
+          # bundle_file. This download+push-only job never extracts or runs the bundle's
+          # contents; `gh release upload`/`delete-asset` only move the opaque blob around.
+          gh release upload recheck-bundle "bundle-out/$BUNDLE_FILE" --repo "$OWNER_REPO"
+          # Keep a few of the most recent bundle assets (covers a node that's a run or two
+          # behind) and prune the rest, so this release's asset list doesn't grow without bound.
+          mapfile -t stale < <(gh release view recheck-bundle --repo "$OWNER_REPO" --json assets \
+            --jq '.assets | sort_by(.createdAt) | reverse | .[4:] | .[].name' 2>/dev/null)
+          for asset in "${stale[@]:-}"; do
+            [ -n "$asset" ] || continue
+            echo "pruning old recheck-bundle asset: $asset"
+            gh release delete-asset recheck-bundle "$asset" --repo "$OWNER_REPO" -y || true
+          done
+      - uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: public
+          publish_branch: gh-pages
+          force_orphan: true

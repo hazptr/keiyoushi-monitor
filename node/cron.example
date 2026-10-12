@@ -1,0 +1,8 @@
+# crontab -e, as the user that has `docker` access (no root needed):
+#
+# Poll every 15 minutes. Use `flock` rather than assuming a run always finishes well
+# inside the 15-minute window — a slow recheck, a hung docker pull, or two cron daemons after a
+# clock jump could otherwise overlap two controller.py runs against the same proxy/sandbox
+# network and PAT. `-n` (non-blocking): if a previous run is still going, this invocation just
+# exits instead of queueing up behind it.
+7,22,37,52 * * * * cd ~/keiyoushi-monitor && /usr/bin/flock -n node/.controller.lock /usr/bin/python3 node/controller.py --config node/controller.config.json >> node/controller.log 2>&1

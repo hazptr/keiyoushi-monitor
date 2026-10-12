@@ -1,0 +1,165 @@
+name: ingest
+
+# workflow_dispatch ONLY. This is the one and only way a recheck node's result reaches
+# gh-pages — there is no API token anywhere that can write to gh-pages directly, and the node's
+# own controller never pushes to this branch itself; it only ever dispatches this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      payload_gz_b64:
+        description: "gzip(json)+base64 of {runId, runDate, results[]} — see publisher/node_schema.py"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: python3 publisher/test_scrub.py
+
+  # Split the same way status.yml's build-site/deploy jobs are split — the job that decodes and
+  # merges a node's payload (arbitrary-ish bytes from outside this repo, even though schema- and
+  # freshness-validated) never holds `contents: write`; it only uploads a finished artifact.
+  # `deploy` below just downloads that artifact and pushes it, no repo script touching it.
+  validate-and-merge:
+    needs: selftest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      gh_pages_sha: ${{ steps.gh_pages_sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: proto
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: gh-pages
+          path: gh-pages
+          persist-credentials: false
+      # Deploy race: this job builds merged-status.json/public/ against gh-pages AS OF right now
+      # — if another deploy (this workflow's own, or status.yml's) pushes to gh-pages before
+      # THIS job's own deploy runs, `force_orphan: true` would blow that away wholesale rather
+      # than merge with it. Record the exact commit read here; `deploy` re-checks it's still
+      # gh-pages's tip immediately before pushing and aborts rather than overwrite a newer commit.
+      - id: gh_pages_sha
+        run: echo "sha=$(git -C gh-pages rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: validate the dispatch input's shape before touching it
+        env:
+          PAYLOAD_GZ_B64: ${{ inputs.payload_gz_b64 }}
+        run: |
+          # Charset + a generous size ceiling, checked before anything decodes it. Never
+          # interpolated into a shell string as a GH expression — only ever read from the environment.
+          printf '%s' "$PAYLOAD_GZ_B64" > payload.b64
+          bytes=$(wc -c < payload.b64)
+          [ "$bytes" -le 131072 ] || { echo "::error::payload is $bytes bytes, over the 128KiB ceiling"; exit 1; }
+          grep -Eq '^[A-Za-z0-9+/=]+$' payload.b64 || { echo "::error::payload is not plain base64"; exit 1; }
+
+      - name: decode, validate strictly against recheck.json, merge
+        run: |
+          python3 - <<'PYEOF'
+          import base64, datetime as dt, gzip, json, sys
+          sys.path.insert(0, "proto/publisher")
+          from node_schema import validate_node_payload, validate_recheck_manifest
+
+          manifest = validate_recheck_manifest(json.loads(open("gh-pages/recheck.json").read()))
+          raw = base64.b64decode(open("payload.b64", "rb").read())
+
+          # Cap the decompressed size too, not just the compressed/base64 one — a small
+          # gzip payload can still expand to something absurd. 1MiB is already ~100x more than a
+          # 300-row category-only payload needs.
+          MAX_DECOMPRESSED = 1 * 1024 * 1024
+          with gzip.GzipFile(fileobj=__import__("io").BytesIO(raw)) as gz:
+              body = gz.read(MAX_DECOMPRESSED + 1)
+          if len(body) > MAX_DECOMPRESSED:
+              sys.exit(f"decompressed payload exceeds the {MAX_DECOMPRESSED}-byte cap; refusing")
+          payload = json.loads(body)
+
+          # Freshness: a dispatch must be reporting on THIS run's recheck.json, not a stale or
+          # forged one claiming extensions it was never asked to check.
+          if payload.get("runId") != manifest["runId"]:
+              sys.exit(f"payload runId {payload.get('runId')!r} does not match the published "
+                        f"recheck.json runId {manifest['runId']!r}; refusing a stale/mismatched report")
+
+          # Require runDate to be within +/-1 day of UTC today — a node that's been offline
+          # for a while, or a replayed/forged dispatch, shouldn't be able to backdate/forwarddate
+          # a result far from when it actually ran.
+          run_date_str = payload.get("runDate")
+          try:
+              run_date = dt.date.fromisoformat(run_date_str)
+          except (TypeError, ValueError):
+              sys.exit(f"runDate {run_date_str!r} is not a real calendar date")
+          today = dt.datetime.now(dt.timezone.utc).date()
+          if abs((run_date - today).days) > 1:
+              sys.exit(f"runDate {run_date_str!r} is more than 1 day from today ({today.isoformat()}); refusing a stale/forged report")
+
+          allowed_ids = set(manifest["extensions"])
+          validated = validate_node_payload(payload, allowed_ids, run_date=run_date_str)
+          json.dump(validated, open("node-payload.json", "w"))
+          print(f"validated {len(validated['results'])} row(s) for run {validated['runId']}")
+          PYEOF
+          python3 proto/publisher/merge_node_result.py gh-pages/status.json node-payload.json merged-status.json
+
+      - name: assemble the published tree (everything already on gh-pages, status.json replaced, no .git)
+        run: |
+          rm -rf public
+          mkdir -p public
+          # Never copy gh-pages's own checkout .git metadata into the published tree. Also
+          # excludes the old recheck-bundle filename/checksum in case an older gh-pages snapshot
+          # still had one lying around — the bundle is a Release asset now, never re-pushed from
+          # here.
+          (cd gh-pages && tar -c --exclude=.git --exclude=recheck-bundle.tar.zst --exclude=recheck-bundle.tar.zst.sha256 .) | (cd public && tar -x)
+          cp merged-status.json public/status.json
+
+      # Backstop: node output is category-only by construction; this just re-asserts it.
+      - name: leak-check before publishing
+        run: python3 proto/publisher/leak_check.py public
+
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: ingest-site
+          path: public/
+
+  deploy:
+    needs: validate-and-merge
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gh-pages-publish   # shared with status.yml's `deploy` job: never race a gh-pages push
+    permissions:
+      contents: write   # the ONLY job in this workflow that can push; it only downloads the
+                         # finished artifact above and pushes it, no repo script runs on it here.
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ingest-site
+          path: public
+      - name: abort if gh-pages moved since validate-and-merge read it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_SHA: ${{ needs.validate-and-merge.outputs.gh_pages_sha }}
+          OWNER_REPO: ${{ github.repository }}
+        run: |
+          # `gh api`, not a bare `git ls-remote` — this repo can be private, and an
+          # unauthenticated ls-remote against a private repo just fails outright rather than
+          # reporting "moved" or "not moved".
+          actual=$(gh api "repos/${OWNER_REPO}/branches/gh-pages" --jq '.commit.sha')
+          if [ -z "$actual" ]; then
+            echo "::error::could not resolve gh-pages's current tip via the API"; exit 1
+          fi
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::gh-pages moved from $EXPECTED_SHA to $actual since validate-and-merge read it (another deploy landed in between); aborting rather than overwrite it with a force_orphan push built against the stale snapshot"
+            exit 1
+          fi
+      - uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: public
+          publish_branch: gh-pages
+          force_orphan: true

@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy this to controller.config.json, fill in the PAT, and chmod 600 it. See README.md.",
+  "pages_url": "https://<owner>.github.io/<repo>",
+  "repo": "<owner>/<repo>",
+  "pat": "github_pat_...",
+  "proxy_host": "proxy",
+  "proxy_port": 3128,
+  "mem_limit": "1500m",
+  "pids_limit": 256,
+  "cpus": 2,
+  "state_file": "node/.last_run_id",
+  "verify_attestation": true,
+  "skip_own_ip_lookup": false,
+  "chrome_sandbox": false
+}

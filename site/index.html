@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#101012" media="(prefers-color-scheme: dark)">
+<meta name="description" content="Daily status of every keiyoushi 1.6 extension">
+<title>keiyoushi extension status</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<aside class="side">
+  <header>
+    <h1>keiyoushi extension status</h1>
+    <p class="muted small" id="meta">Loading…</p>
+  </header>
+
+  <section class="summary" aria-label="Summary">
+    <div class="sbar" id="sbar" aria-hidden="true"></div>
+    <div class="legend" id="legend" role="group" aria-label="Filter by status"></div>
+    <div class="progress small muted" id="progress" hidden>
+      <span id="progress-text"></span>
+      <span class="ptrack"><span class="pfill" id="pfill"></span></span>
+    </div>
+    <p class="note small">Results can be wrong: sites change, block automated checks or go down for a bit. Check in the
+      app before opening an issue. <a href="#about">How it’s checked</a></p>
+  </section>
+
+
+  <div class="bar">
+    <div class="search">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6"/><path d="m14 14 4 4"/></svg>
+      <input id="q" type="search" placeholder="Search extensions" aria-label="Search extensions" autocomplete="off" spellcheck="false">
+      <kbd>/</kbd>
+    </div>
+    <select id="lang" aria-label="Language"><option value="">All languages</option></select>
+    <select id="content" aria-label="Content">
+      <option value="">SFW only</option>
+      <option value="all">All content</option>
+      <option value="nsfw">NSFW only</option>
+    </select>
+    <select id="sort" aria-label="Sort">
+      <option value="">By status</option>
+      <option value="name">By name</option>
+      <option value="recent">Recently changed</option>
+    </select>
+  </div>
+
+  <details class="about small" id="about">
+    <summary>How it’s checked</summary>
+    <p>Each extension runs on a JVM harness, no phone. It loads popular, opens a manga and its chapter
+      list, loads the newest chapter, then downloads and decodes two pages through the extension’s own
+      client. Anything that fails gets one retry before it counts.</p>
+    <p><b>Partly working</b> means you can still read, but something else (search, latest updates) fails.
+      <b>Can’t test</b> means we couldn’t get a result at all, usually a Cloudflare challenge the harness
+      can’t solve. The app handles most of those, so check there.</p>
+    <p><b>Not checked yet</b> means today’s run hasn’t reached it; the last result is shown instead.
+      <b>Not supported</b> means the extension still uses the older 1.4 extension API, which this checker doesn’t run.</p>
+    <p><b>Notes</b> are things worth knowing that don’t stop reading, like a source repeating titles in its
+      lists or only some titles opening. Before an extension counts as not working, up to three titles get
+      a try, and every failure is checked once more at the end of the run.</p>
+    <p>Some of the checks (page 2 of lists, placeholder images) come from
+      <a href="https://github.com/vetleledaal/keiyoushi-status">vetleledaal’s keiyoushi-status</a>.</p>
+    <p>The small bars on each row are the last two weeks of runs, newest on the right. This runs off main,
+      so it can be ahead of what’s published. Not affiliated with keiyoushi.</p>
+  </details>
+</aside>
+
+<div class="content">
+  <section class="changes" id="changes" hidden>
+    <h2 class="small" id="changes-title">Changed since the last run</h2>
+    <ul class="clist" id="clist"></ul>
+    <button type="button" class="linkish small" id="cmore" hidden></button>
+  </section>
+
+  <p class="muted small" id="count" aria-live="polite"></p>
+  <p class="hidden-hint small" id="hidden-hint" hidden></p>
+  <div id="groups"></div>
+  <p class="empty muted" id="empty" hidden></p>
+
+</div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+# The recheck node's network topology. `docker compose -f node/compose.yml up -d proxy` (which
+# node/controller.py runs before every poll) brings up:
+#
+#   sandbox-net   internal: true, PLUS gateway_mode_ipv4/ipv6: isolated (see
+#                 below): no route to the outside world, no route to the host's LAN, AND no route
+#                 to the host itself via the bridge's own gateway IP. `internal: true` alone does
+#                 NOT give you that last one — verified on this host: a container on a plain
+#                 `internal: true` network could still reach the HOST's sshd by connecting
+#                 directly to the bridge gateway address (e.g. `nc 192.168.x.1 22` succeeded),
+#                 because `internal` only withholds a route to the wider network, not the
+#                 gateway's own listening sockets on 0.0.0.0. `gateway_mode_ipv4: isolated`
+#                 (Docker >=28) removes the gateway IP from the network entirely — confirmed here
+#                 too: the same connection attempt then fails with "Network unreachable", and the
+#                 network's IPAM no longer even reports a Gateway address. The ONLY thing attached
+#                 to this network besides the sandbox container itself is the proxy's inside leg.
+#   egress-net    the proxy's OUTSIDE leg. Ordinary bridge network with normal outbound access.
+#   proxy         Squid, pinned by digest, straddling both networks. It is the sandbox's only way
+#                 out. Squid (not tinyproxy) specifically because its `acl ... dst` rules are
+#                 checked against the resolved destination IP, including for CONNECT/HTTPS
+#                 tunnels — a hostname-only filter can be defeated by DNS rebinding (a public
+#                 hostname that resolves to 192.168.x.x), an IP-based ACL can't. See
+#                 proxy/squid.conf for exactly what's denied (RFC1918, link-local, CGNAT 100.64/10,
+#                 loopback, 0.0.0.0/8, multicast, IPv6 link-local/ULA/mapped-v4, and the
+#                 169.254.169.254 cloud metadata address) and allowed (ports 80/443 only), and
+#                 proxy/own-ip.generated.conf (gitignored, rewritten by controller.py on every
+#                 poll) for the node's own public IP deny rule — stops hairpin access to
+#                 whatever this node's own public IP happens to also expose.
+#
+# The sandbox container itself is NOT a compose service here: node/controller.py starts it with
+# a plain `docker run` per recheck, attached only to sandbox-net, so its exact resource limits
+# and mounts can be varied per run without editing this file. See node/README.md for the
+# DOCKER-USER-iptables alternative if you have root and would rather enforce this at the host
+# firewall instead of (or in addition to) the proxy.
+networks:
+  sandbox-net:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+  egress-net: {}
+
+services:
+  proxy:
+    # Pinned by digest — never a floating tag.
+    image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    # Squid's own startup drops root -> its configured cache_effective_user internally (setuid/
+    # setgid), which needs CAP_SETUID/CAP_SETGID; `cap_drop: ALL` here breaks that transition
+    # (squid aborts on startup). The proxy is a vetted upstream image doing one job — forwarding
+    # traffic per squid.conf's ACLs — not the untrusted code path; the sandbox container (run by
+    # node/controller.py, not this compose file) is where no-new-privileges/cap-drop/non-root
+    # actually apply, per the review's requirements.
+    networks:
+      sandbox-net:
+        aliases: [proxy]
+      egress-net: {}
+    volumes:
+      - ./proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./proxy/own-ip.generated.conf:/etc/squid/own-ip.generated.conf:ro
+    restart: unless-stopped

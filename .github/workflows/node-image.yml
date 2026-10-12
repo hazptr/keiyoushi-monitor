@@ -1,0 +1,114 @@
+name: node-image
+
+# Builds and publishes the recheck node's sandbox image to GHCR, digest-pinned, and attempts a
+# signed build-provenance attestation (not available on every repo/plan — see the `attest build
+# provenance` step below). This workflow never touches any self-hosted runner — it just builds a
+# container image on a GitHub-hosted runner, the same as any other image-publishing workflow
+# would.
+#
+# This workflow never commits a digest file back to `main` on every push — that would be a
+# write-permission job extracting/trusting its own prior output round-tripped through git.
+# Instead, whoever CONSUMES the image (status.yml's `build-site` job) resolves the digest it
+# actually wants to pin at publish time, via `docker buildx imagetools inspect` against the
+# `:latest` tag — see that job for how `nodeImage` and `harnessRuntimeCommit` get into
+# recheck.json. Nothing in this repo writes a digest file automatically.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "node/Dockerfile"
+      - "node/entrypoint.sh"
+      - "node/extract_bundle.py"
+      - "node/categorize.py"
+      - "publisher/node_schema.py"
+      - "harness/ci/**"
+      - "harness/webview/**"
+      - "harness/runtime/**"
+      - ".github/workflows/node-image.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write        # to push to GHCR
+  id-token: write        # to mint the Sigstore identity for the attestation
+  attestations: write    # to publish the build-provenance attestation
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    env:
+      RUNTIME_JAVA_VERSION: "21"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Bake the harness runtime (the app stand-in) straight into the image: the recheck
+      # bundle no longer carries it at all, so the node always runs a known-good runtime build
+      # that matches THIS commit, not something bundled alongside untrusted-adjacent build output.
+      - uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.RUNTIME_JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@d156388eb19639ec20ade50009f3d199ce1e2808 # v4.1.0
+        with:
+          cache-disabled: true
+        # This image's runtime build is tiny and one-shot per push; a persistent Gradle cache
+        # buys nothing here and would otherwise share a cache namespace with status.yml's
+        # extension-build job on this action version (no explicit namespace input exists on it).
+      - run: harness/ci/build-runtime.sh harness/runtime node/runtime-dist
+
+      - name: record the commit this image's runtime+entrypoint were built from
+        env:
+          SHA: ${{ github.sha }}
+        run: echo "$SHA" > node/RUNTIME_COMMIT
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - id: build
+        uses: docker/build-push-action@ca877d9245402d1537745e0e356eab47c3520991 # v6.13.0
+        with:
+          context: .
+          file: node/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}-node:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: false   # keep the image reference a plain digest; recheck.json pins that —
+                               # the attestation below covers provenance instead.
+
+      # GitHub attestations are NOT available for a private, user-owned (non-org) repository on
+      # the free/no-attestations plan — confirmed by running this: the API call fails with
+      # "Feature not available for user-owned private repositories. To enable this feature,
+      # please make this repository public." `continue-on-error` so that doesn't fail the whole
+      # job (the image is already pushed by this point) — the summary step below reports whether
+      # it actually succeeded, and node/README.md documents the `verify_attestation: false`
+      # escape hatch for exactly this case. Org-owned or public repos get a real attestation.
+      - id: attest
+        name: attest build provenance
+        continue-on-error: true
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-name: ghcr.io/${{ github.repository }}-node
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: summary
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          OWNER_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+        run: |
+          echo "pushed ghcr.io/${OWNER_REPO}-node@${IMAGE_DIGEST}, runtime commit ${SHA}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ATTEST_OUTCOME" = "success" ]; then
+            echo "Attested. A node verifies this with: gh attestation verify oci://ghcr.io/${OWNER_REPO}-node@${IMAGE_DIGEST} --repo ${OWNER_REPO}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**NOT attested** — the attestation step failed (commonly: this repo is a private, user-owned repo, which GitHub does not support attestations for at all). Nodes polling this repo need \`\"verify_attestation\": false\` in controller.config.json, or make this repo public/org-owned instead." >> "$GITHUB_STEP_SUMMARY"
+          fi

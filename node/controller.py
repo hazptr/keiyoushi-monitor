@@ -546,6 +546,34 @@ def sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date, proxy_port=Non
     return validated
 
 
+RUNTIME_PATHS = ("harness/runtime/", "harness/ci/build-runtime.sh")
+
+
+def image_revision(image: str) -> str:
+    """The commit a node image was built from (node-image.yml's revision label)."""
+    out = subprocess.run(["docker", "buildx", "imagetools", "inspect", image, "--format", "{{json .}}"],
+                         capture_output=True, text=True, check=True)
+    img = json.loads(out.stdout).get("image") or {}
+    conf = img.get("config") if "config" in img else next(iter(img.values()), {}).get("config", {})
+    commit = (conf or {}).get("Labels", {}).get("org.opencontainers.image.revision", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        sys.exit(f"{image} has no revision label; refusing")
+    return commit
+
+
+def same_runtime(cfg: dict, base: str, head: str) -> None:
+    """Refuse unless nothing the baked-in harness runtime is built from changed between commits."""
+    cmp = _github_api("GET", f"/repos/{cfg['repo']}/compare/{base}...{head}", github_token(cfg))
+    if cmp.get("status") not in ("ahead", "identical"):
+        sys.exit(f"{head[:7]} isn't ahead of {base[:7]} on {cfg['repo']}; refusing")
+    if len(cmp.get("files", [])) >= 300:
+        sys.exit("too many changed files to check the runtime is unchanged; refusing")
+    changed = [f["filename"] for f in cmp.get("files", []) if f["filename"].startswith(RUNTIME_PATHS)]
+    if changed:
+        sys.exit(f"the harness runtime changed between {base[:7]} and {head[:7]} ({', '.join(changed[:5])}); "
+                 "this image can't run that recheck.json")
+
+
 def one_pass(cfg: dict, force: bool = False, image: str | None = None) -> bool:
     # Fetch recheck.json ONCE, validate it, and use exactly those bytes from here on — never
     # re-fetch it (or the bundle) a second time to "double check"; a second fetch could silently
@@ -557,8 +585,12 @@ def one_pass(cfg: dict, force: bool = False, image: str | None = None) -> bool:
         # A newer node image for the same run (e.g. a fix landed after the sweep). It still has to
         # pass validate_node_image() and the attestation check in run_sandbox(), and the image's
         # own runtime-commit check against recheck.json.
+        validate_node_image(cfg, image)
+        commit = image_revision(image)
+        same_runtime(cfg, manifest["harnessRuntimeCommit"], commit)
         log(f"using {image} instead of recheck.json's {manifest['nodeImage']}")
-        manifest = {**manifest, "nodeImage": image}
+        manifest = {**manifest, "nodeImage": image, "harnessRuntimeCommit": commit}
+        manifest_bytes = json.dumps(manifest).encode()
 
     last = state_path(cfg)
     if not force and last.exists() and last.read_text().strip() == manifest["runId"]:

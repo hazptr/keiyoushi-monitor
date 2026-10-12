@@ -10,7 +10,7 @@ on:
     inputs:
       extensions_file:
         description: "Path (in this repo) to the lang/name list to check; blank = every 1.6 extension"
-        default: ci-sample.txt
+        default: ""
       extensions_source_ref:
         description: "keiyoushi/extensions-source ref/SHA to pin to; blank = main HEAD"
         default: ""

@@ -21,7 +21,7 @@ this machine a job. Instead:
    actual publishing; the controller never pushes to `gh-pages` itself.
 
 Nothing here registers a runner, accepts a job GitHub assigns, or gives this machine's Actions
-credentials any more power than "dispatch one workflow" — see "The PAT" below for exactly what
+credentials any more power than "dispatch one workflow" — see "The GitHub App" below for exactly what
 that credential can and can't do; it's wider than "dispatch one workflow" alone, and the actual
 scope is spelled out there rather than undersold here.
 
@@ -191,20 +191,17 @@ API-incompatible runtime against a bundle it wasn't built for.
    If it's a private, user-owned fork, set `"verify_attestation": false` in
    `controller.config.json` (step 3) — otherwise the controller refuses to run the image at all,
    since it can never find an attestation to verify. Public or organization-owned repos get a
-   real one and should leave verification on. `gh attestation verify` only needs read access to
-   this repo's attestations, not the node's own PAT — install `gh` and authenticate it with a
-   **separate, read-only `GH_TOKEN`** (a classic PAT with no scopes, or a fine-grained PAT with
-   just "Metadata: read", works for a public repo; `gh auth login` with a broad interactive
-   token is more than this one check needs) rather than reusing the controller's own
-   Actions-dispatch PAT for it. **Make the `-node` package public** — your repo's Packages tab
+   real one and should leave verification on. This needs `gh` 2.49 or newer (`gh_path` in the
+   config if it isn't the one on `PATH`); the controller hands it the node's own token, so no
+   `gh auth login` is needed. **Make the `-node` package public** — your repo's Packages tab
    → the package → Package settings → Change visibility → Public — `controller.py` never runs
    `docker login`, so `docker run` can only pull the image anonymously; a private package (GHCR's
    default) fails the pull with no clearer error than "pull access denied". If you'd rather not
    make it public at all, build the image locally from `node/Dockerfile` instead (see "The sandbox
    image" above) and skip GHCR entirely.
 3. `cp node/controller.config.example.json node/controller.config.json`, fill in `pages_url`,
-   `repo`, and a **fine-grained PAT** (see below), then `chmod 600 node/controller.config.json`
-   — the controller refuses to even read it otherwise.
+   `repo`, `app_id` and `app_private_key_file` (see "The GitHub App" below), then
+   `chmod 600` both the config and the key — the controller refuses to read either otherwise.
 4. Install the systemd user timer (`node/systemd/`) or the cron entry (`node/cron.example`,
    which uses `flock` so an overrunning or overlapping invocation doesn't start a second one).
    Either just runs `python3 node/controller.py --config node/controller.config.json` on a
@@ -212,38 +209,34 @@ API-incompatible runtime against a bundle it wasn't built for.
 5. `python3 node/controller.py --config node/controller.config.json --once` to try it by hand
    first.
 
-### The PAT
+### The GitHub App
 
-A **fine-grained PAT, scoped to this one repository, with exactly one permission: "Actions: read
-and write"** (plus the implicit "Metadata: read" every fine-grained PAT carries — there's no way
-to omit it). Be clear-eyed about what that scope actually grants on this one repo, because it's
-wider than "dispatch one workflow":
+The node reports back by dispatching `ingest.yml`, which needs a credential. Use a GitHub App
+rather than a personal token: it isn't tied to anyone's account, doesn't expire, and the node
+only ever holds an hour-long token minted from the app's key on each run.
 
-- it **can** call `POST .../actions/workflows/ingest.yml/dispatches` (what this controller
-  actually uses it for);
-- it also **can** dispatch `status.yml` and `node-image.yml` — including dispatching `status.yml`
-  with `publish=true` and an old `extensions_source_ref` or a tiny `extensions_file` list, which
-  would publish a stale/truncated status page over the real one — re-run or cancel any workflow
-  run, delete workflow runs/logs and Actions caches, download any run's artifacts (including,
-  e.g., `extensions-build` — not secret, but not nothing either), and enable/disable workflows
-  for this repo;
-- it **cannot** read or write code, issues, pull requests, releases, or repo settings;
-- it **cannot** register, remove, or otherwise touch any runner (there are none).
+1. Create the app:
+   `https://github.com/settings/apps/new?name=<your-name>-keiyoushi-monitor-node&url=https://github.com/<owner>/<repo>&public=false&webhook_active=false&actions=write`
+   (that pre-fills it: no webhook, only installable on your account, and one permission,
+   **Actions: read and write**). Note the **App ID** on the page you land on.
+2. On the same page, **Generate a private key**. Save the downloaded `.pem` on the node, e.g.
+   `~/.config/keiyoushi-monitor/app.pem`, and `chmod 600` it.
+3. **Install App** → your account → **Only select repositories** → this repo.
+4. Put the App ID and the key's path in `controller.config.json`.
 
-**Prefer a short expiry** and rotate it rather than setting "no expiration". If you want stricter
-isolation than "Actions: read and write" on your main repo gives you, run the node against a
-**separate, dedicated ingest-only repo** instead (its `ingest.yml` dispatches into the real repo
-with its own, more narrowly-scoped credential) — this repo doesn't build that for you, but the
-PAT's own scope is the only thing standing between "the controller can dispatch ingest" and "a
-compromised controller can also re-run/cancel/delete this repo's Action history", so it's worth
-doing if that distinction matters to your threat model.
+Each run, `controller.py` signs a short JWT with the key (via the `openssl` CLI, so there's
+nothing to `pip install`) and asks for an installation token limited to this one repo and
+Actions write. That token can dispatch, re-run, cancel and delete workflow runs and download
+artifacts on this repo. It can't read or write code, issues, pull requests, releases or
+settings. The same token is what `gh attestation verify` gets.
 
-It lives only in `node/controller.config.json`, mode 600, on this machine. **It is never passed
-into the sandbox container** — `run_sandbox()` in `controller.py` only ever sets the proxy
-address as an env var; the PAT, the repo name, and the Pages URL never cross into the container
-at all. If you ever suspect it leaked, revoke it from the fork's PAT settings — recheck.json and
-the bundle are public reads, so nothing about *fetching* work needs a credential; only
-*reporting back* does.
+A fine-grained personal token (this repo only, Actions read and write) also works: put it in
+`pat` instead of `app_id`/`app_private_key_file`.
+
+Neither the key nor any token is ever passed into the sandbox container — `run_sandbox()` only
+sets the proxy address as an env var. If you think the key leaked, delete it on the app's
+settings page and generate a new one. recheck.json and the bundle are public, so fetching work
+needs no credential; only reporting back does.
 
 ### Network isolation
 

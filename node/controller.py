@@ -6,7 +6,7 @@ work, runs one ephemeral, locked-down container and reports back once.
 
     controller.py --config /path/to/config.json [--once] [--teardown]
 
-See node/README.md for the full setup (config file fields, PAT scope, network model) and
+See node/README.md for the full setup (config file fields, GitHub App, network model) and
 node/compose.yml for the egress-proxy + sandbox network topology this script drives via
 `docker compose`. Intended to be invoked by a systemd user timer or cron entry
 (node/systemd/*, node/cron.example) — each invocation does at most one recheck run and exits.
@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -48,10 +49,57 @@ def load_config(path: Path) -> dict:
     if mode & 0o077:
         sys.exit(f"refusing to read {path}: mode {oct(mode)} is readable/writable by group or other; chmod 600 it")
     cfg = json.loads(path.read_text())
-    for k in ("pages_url", "repo", "pat", "proxy_host", "proxy_port"):
+    for k in ("pages_url", "repo", "proxy_host", "proxy_port"):
         if k not in cfg:
             sys.exit(f"config is missing required field: {k}")
+    if bool(cfg.get("pat")) == bool(cfg.get("app_id")):
+        sys.exit("config needs exactly one of: app_id + app_private_key_file (a GitHub App), or pat")
+    if cfg.get("app_id"):
+        if not cfg.get("app_private_key_file"):
+            sys.exit("config has app_id but no app_private_key_file")
+        key = Path(cfg["app_private_key_file"]).expanduser()
+        if key.stat().st_mode & 0o077:
+            sys.exit(f"refusing to use {key}: readable/writable by group or other; chmod 600 it")
+        cfg["app_private_key_file"] = str(key)
     return cfg
+
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _github_api(method: str, path: str, token: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        f"https://api.github.com{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        sys.exit(f"GitHub API {method} {path} failed: {e.code} {e.read().decode(errors='replace')[:300]}")
+
+
+def app_token(cfg: dict) -> str:
+    """An hour-long installation token for this one repo, Actions write only, minted from the
+    GitHub App's private key. Signed with the openssl CLI so the controller stays stdlib-only."""
+    now = int(time.time())
+    head = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    claims = _b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(cfg["app_id"])}).encode())
+    sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", cfg["app_private_key_file"]],
+                         input=f"{head}.{claims}".encode(), capture_output=True, check=True).stdout
+    jwt = f"{head}.{claims}.{_b64url(sig)}"
+    inst = _github_api("GET", f"/repos/{cfg['repo']}/installation", jwt)["id"]
+    return _github_api("POST", f"/app/installations/{inst}/access_tokens", jwt, {
+        "repositories": [cfg["repo"].split("/", 1)[1]],
+        "permissions": {"actions": "write"},
+    })["token"]
+
+
+def github_token(cfg: dict) -> str:
+    return app_token(cfg) if cfg.get("app_id") else cfg["pat"]
 
 
 def state_path(cfg: dict) -> Path:
@@ -251,12 +299,12 @@ def verify_image_attestation(cfg: dict, image: str) -> None:
     if not cfg.get("verify_attestation", True):
         log("verify_attestation is disabled in config; skipping (NOT recommended)")
         return
-    gh = shutil.which("gh")
+    gh = cfg.get("gh_path") or shutil.which("gh")
     if not gh:
         sys.exit(
             "verify_attestation is enabled (the default) but the `gh` CLI is not installed, so "
             "this node cannot verify the node image's build-provenance attestation before "
-            "running it. Install `gh` (and `gh auth login`), or explicitly set "
+            "running it. Install `gh` 2.49 or newer (or point gh_path at one), or explicitly set "
             '"verify_attestation": false in controller.config.json if you accept running an '
             "unverified image (not recommended)."
         )
@@ -264,13 +312,19 @@ def verify_image_attestation(cfg: dict, image: str) -> None:
     # node-image.yml running on main in THIS repo — not just any attestation gh's lookup happens
     # to accept for the digest. --deny-self-hosted-runners refuses one signed on a self-hosted
     # runner (this repo never registers one, but a fork's config could) rather than trusting a
-    # GitHub-hosted-runner build is where this digest actually came from. `gh` only needs a
-    # read-only token for this (GH_TOKEN env var with no scopes beyond public read, or an
-    # unauthenticated `gh` for a public repo) — avoid `gh auth login` with a broader token just
-    # to run this one read-only verification.
-    run(["gh", "attestation", "verify", f"oci://{image}", "--repo", cfg["repo"],
+    # GitHub-hosted-runner build is where this digest actually came from. `gh` won't run without
+    # a token even for a public repo; it gets the node's own (GH_TOKEN, a throwaway config dir)
+    # rather than whatever `gh auth login` left on this machine.
+    with tempfile.TemporaryDirectory() as ghcfg:
+        env = {**os.environ, "GH_TOKEN": github_token(cfg), "GH_CONFIG_DIR": ghcfg}
+        env.pop("GITHUB_TOKEN", None)
+        _verify(gh, cfg, image, env)
+
+
+def _verify(gh: str, cfg: dict, image: str, env: dict) -> None:
+    run([gh, "attestation", "verify", f"oci://{image}", "--repo", cfg["repo"],
          "--signer-workflow", f"{cfg['repo']}/.github/workflows/node-image.yml",
-         "--source-ref", "refs/heads/main", "--deny-self-hosted-runners"])
+         "--source-ref", "refs/heads/main", "--deny-self-hosted-runners"], env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +416,7 @@ def run_sandbox(cfg: dict, manifest: dict, input_dir: Path) -> bytes:
             "--name", f"{COMPOSE_PROJECT}-sandbox-run",
             "--",
             image]
-    # The PAT, the repo, the Pages URL — nothing from `cfg` is ever passed to this container.
+    # The app key, any token, the repo, the Pages URL — nothing from `cfg` is ever passed to this container.
     # Only EXT_RUN_WV_PROXY / JAVA_PROXY_OPTS (where to send traffic) cross that boundary.
     name = f"{COMPOSE_PROJECT}-sandbox-run"
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)  # stale leftover from a
@@ -387,7 +441,7 @@ def dispatch_ingest(cfg: dict, payload: dict):
         url, method="POST",
         data=json.dumps({"ref": "main", "inputs": {"payload_gz_b64": compact}}).encode(),
         headers={
-            "Authorization": f"Bearer {cfg['pat']}",
+            "Authorization": f"Bearer {github_token(cfg)}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
         },

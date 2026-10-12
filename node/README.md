@@ -238,6 +238,19 @@ sets the proxy address as an env var. If you think the key leaked, delete it on 
 settings page and generate a new one. recheck.json and the bundle are public, so fetching work
 needs no credential; only reporting back does.
 
+### Going out through another proxy
+
+By default the proxy goes out directly from this machine. To send the sandbox's traffic through
+another HTTP proxy first, such as a VPN container's built-in one, set in the config:
+
+- `upstream_proxy`: `"host:port"` of that proxy, e.g. `"gluetun-node:8888"`;
+- `upstream_network`: the Docker network it's on, which the proxy container joins to reach it;
+- `direct_fallback`: `true` to give anything that didn't pass through the upstream one more try
+  going out directly, and report that result instead.
+
+The proxy's deny rules still apply to every request either way, and nothing about the upstream
+is passed into the sandbox.
+
 ### Network isolation
 
 `node/compose.yml` creates two Docker networks and a proxy container between them:

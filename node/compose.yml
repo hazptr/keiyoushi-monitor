@@ -56,4 +56,5 @@ services:
     volumes:
       - ./proxy/squid.conf:/etc/squid/squid.conf:ro
       - ./proxy/own-ip.generated.conf:/etc/squid/own-ip.generated.conf:ro
+      - ./proxy/upstream.generated.conf:/etc/squid/upstream.generated.conf:ro
     restart: unless-stopped

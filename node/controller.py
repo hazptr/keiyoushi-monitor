@@ -136,6 +136,9 @@ def run(cmd, **kw):
 COMPOSE_PROJECT = "keiyoushi-monitor-node"  # fixed, so the network name below is predictable
 SECCOMP_PROFILE = HERE / "seccomp" / "chrome-userns.json"
 OWN_IP_CONF = HERE / "proxy" / "own-ip.generated.conf"
+UPSTREAM_CONF = HERE / "proxy" / "upstream.generated.conf"
+UPSTREAM_COMPOSE = HERE / "proxy" / "compose.upstream.generated.yml"
+DIRECT_PORT = 3129  # with upstream_proxy + direct_fallback: the proxy port that skips the upstream
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +173,52 @@ def ensure_proxy(cfg: dict):
     and makes squid reload it — a bind-mounted file's new contents don't take effect until
     squid is told to reconfigure."""
     changed = refresh_own_ip_deny(cfg)
+    changed = write_upstream(cfg) or changed
     was_running = _proxy_running()
-    run(["docker", "compose", "-p", COMPOSE_PROJECT, "-f", str(HERE / "compose.yml"), "up", "-d", "proxy"],
+    run(["docker", "compose", "-p", COMPOSE_PROJECT, *compose_files(), "up", "-d", "proxy"],
         cwd=str(HERE))
     if changed and was_running:
         run(["docker", "exec", f"{COMPOSE_PROJECT}-proxy-1", "squid", "-k", "reconfigure"])
     verify_sandbox_network_isolated()
+
+
+def compose_files() -> list:
+    files = ["-f", str(HERE / "compose.yml")]
+    if UPSTREAM_COMPOSE.exists():
+        files += ["-f", str(UPSTREAM_COMPOSE)]
+    return files
+
+
+def write_upstream(cfg: dict) -> bool:
+    """upstream_proxy ("host:port", e.g. a VPN container's HTTP proxy) sends the sandbox's traffic
+    through it; upstream_network is the Docker network the proxy joins to reach it. With
+    direct_fallback, a second proxy port goes out directly, for a retry of what didn't pass.
+    Returns whether the squid side changed."""
+    up = cfg.get("upstream_proxy")
+    conf = ""
+    if up:
+        host, port = up.rsplit(":", 1)
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", host) or not port.isdigit():
+            sys.exit(f"upstream_proxy {up!r} isn't host:port")
+        conf = (f"acl via_upstream localport {cfg['proxy_port']}\n"
+                f"cache_peer {host} parent {port} 0 no-query no-digest default name=upstream\n"
+                "cache_peer_access upstream allow via_upstream\n"
+                "cache_peer_access upstream deny all\n"
+                "never_direct allow via_upstream\n")
+        if cfg.get("direct_fallback"):
+            conf += f"http_port {DIRECT_PORT}\n"
+    net = cfg.get("upstream_network") if up else None
+    if net and not re.fullmatch(r"[A-Za-z0-9._-]+", net):
+        sys.exit(f"upstream_network {net!r} isn't a Docker network name")
+    compose = (f"networks:\n  upstream:\n    external: true\n    name: {net}\n"
+               "services:\n  proxy:\n    networks:\n      upstream: {}\n") if net else None
+    old = UPSTREAM_CONF.read_text() if UPSTREAM_CONF.exists() else None
+    UPSTREAM_CONF.write_text(conf)
+    if compose:
+        UPSTREAM_COMPOSE.write_text(compose)
+    else:
+        UPSTREAM_COMPOSE.unlink(missing_ok=True)
+    return old != conf
 
 
 def verify_sandbox_network_isolated():
@@ -281,7 +324,7 @@ def own_ip_rule_present(cfg: dict) -> bool:
 
 
 def teardown(cfg: dict):
-    run(["docker", "compose", "-p", COMPOSE_PROJECT, "-f", str(HERE / "compose.yml"), "down"], cwd=str(HERE))
+    run(["docker", "compose", "-p", COMPOSE_PROJECT, *compose_files(), "down"], cwd=str(HERE))
 
 
 # ---------------------------------------------------------------------------
@@ -355,24 +398,25 @@ def extract_marked_json(log_text: str, max_bytes: int) -> bytes:
     return body.encode()
 
 
-def run_sandbox(cfg: dict, manifest: dict, input_dir: Path) -> bytes:
+def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | None = None) -> bytes:
     image = manifest["nodeImage"]  # e.g. ghcr.io/<owner>/<repo>-node@sha256:...
     validate_node_image(cfg, image)
     verify_image_attestation(cfg, image)
+    port = proxy_port or cfg["proxy_port"]
 
     mem = cfg.get("mem_limit", "1500m")
     pids = str(cfg.get("pids_limit", 256))
     cpus = str(cfg.get("cpus", "2"))
     proxy_host = cfg["proxy_host"]
-    proxy_url = f"http://{proxy_host}:{cfg['proxy_port']}"
+    proxy_url = f"http://{proxy_host}:{port}"
 
     # Chrome's own sandbox needs user namespaces, which means a widened seccomp profile for the whole
     # container (see node/seccomp/README.md), so it's opt-in.
     want_sandbox = bool(cfg.get("chrome_sandbox", False))
     sandbox_ok, sandbox_detail = chrome_sandbox_supported() if want_sandbox else (False, "chrome_sandbox is off in the config")
     env = {"EXT_RUN_WV_PROXY": proxy_url,
-           "JAVA_PROXY_OPTS": f"-Dhttps.proxyHost={proxy_host} -Dhttps.proxyPort={cfg['proxy_port']} "
-                               f"-Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={cfg['proxy_port']}"}
+           "JAVA_PROXY_OPTS": f"-Dhttps.proxyHost={proxy_host} -Dhttps.proxyPort={port} "
+                               f"-Dhttp.proxyHost={proxy_host} -Dhttp.proxyPort={port}"}
     security_opts = ["no-new-privileges"]
     if sandbox_ok and SECCOMP_PROFILE.exists():
         security_opts.append(f"seccomp={SECCOMP_PROFILE}")
@@ -453,6 +497,15 @@ def dispatch_ingest(cfg: dict, payload: dict):
     log(f"dispatched ingest.yml with a {len(compact)}-char payload")
 
 
+def sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date, proxy_port=None) -> dict:
+    payload_bytes = run_sandbox(cfg, manifest, input_dir, proxy_port)
+    if len(payload_bytes) > MAX_PAYLOAD_BYTES:
+        sys.exit(f"sandbox result is {len(payload_bytes)} bytes, over the {MAX_PAYLOAD_BYTES}-byte cap")
+    validated = validate_node_payload(json.loads(payload_bytes), allowed_ids, run_date=run_date)
+    log(f"validated {len(validated['results'])} row(s) for run {validated['runId']}")
+    return validated
+
+
 def one_pass(cfg: dict, force: bool = False) -> bool:
     # Fetch recheck.json ONCE, validate it, and use exactly those bytes from here on — never
     # re-fetch it (or the bundle) a second time to "double check"; a second fetch could silently
@@ -499,12 +552,21 @@ def one_pass(cfg: dict, force: bool = False) -> bool:
         for f in input_dir.iterdir():
             os.chmod(f, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
 
-        payload_bytes = run_sandbox(cfg, manifest, input_dir)
-        if len(payload_bytes) > MAX_PAYLOAD_BYTES:
-            sys.exit(f"sandbox result is {len(payload_bytes)} bytes, over the {MAX_PAYLOAD_BYTES}-byte cap")
-        payload = json.loads(payload_bytes)
-        validated = validate_node_payload(payload, allowed_ids, run_date=run_date)
-        log(f"validated {len(validated['results'])} row(s) for run {validated['runId']}")
+        validated = sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date)
+        if cfg.get("upstream_proxy") and cfg.get("direct_fallback"):
+            # Same as the daily sweep: whatever didn't pass through the upstream gets one more go
+            # going out directly, and that result is the one reported.
+            retry = sorted(r["id"] for r in validated["results"] if r["category"] != "pass")
+            if retry:
+                log(f"{len(retry)} didn't pass through upstream_proxy; retrying them directly")
+                (input_dir / "recheck.json").chmod(0o644)
+                (input_dir / "recheck.json").write_text(json.dumps({**manifest, "extensions": retry}))
+                (input_dir / "recheck.json").chmod(0o444)
+                direct = sandbox_pass(cfg, manifest, input_dir, set(retry), run_date, DIRECT_PORT)
+                by_id = {r["id"]: r for r in direct["results"]}
+                validated["results"] = [by_id.get(r["id"], r) for r in validated["results"]]
+                passed = sum(r["category"] == "pass" for r in direct["results"])
+                log(f"direct retry: {passed} of {len(retry)} passed")
 
     dispatch_ingest(cfg, validated)
     last.write_text(manifest["runId"])

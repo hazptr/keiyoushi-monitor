@@ -13,3 +13,5 @@ node/runtime-dist/
 node/RUNTIME_COMMIT
 node/*.pat
 node/proxy/own-ip.generated.conf
+node/proxy/upstream.generated.conf
+node/proxy/compose.upstream.generated.yml

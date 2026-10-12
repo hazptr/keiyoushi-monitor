@@ -9,6 +9,7 @@
   "upstream_proxy": null,
   "upstream_network": null,
   "direct_fallback": false,
+  "keep_cookies": false,
   "mem_limit": "1500m",
   "pids_limit": 256,
   "cpus": 2,

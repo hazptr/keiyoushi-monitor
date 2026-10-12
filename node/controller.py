@@ -177,7 +177,9 @@ def ensure_proxy(cfg: dict):
     was_running = _proxy_running()
     run(["docker", "compose", "-p", COMPOSE_PROJECT, *compose_files(), "up", "-d", "proxy"],
         cwd=str(HERE))
-    if changed and was_running:
+    # A recreated container is a fresh squid that reads its config on start (and has no pid file
+    # to signal yet); only one that kept running needs telling.
+    if changed and was_running and _proxy_running() == was_running:
         run(["docker", "exec", f"{COMPOSE_PROJECT}-proxy-1", "squid", "-k", "reconfigure"])
     verify_sandbox_network_isolated()
 
@@ -251,10 +253,12 @@ def verify_sandbox_network_isolated():
     log(f"sandbox network isolation verified: {net} is Internal with no Gateway")
 
 
-def _proxy_running() -> bool:
-    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", f"{COMPOSE_PROJECT}-proxy-1"],
+def _proxy_running() -> str | None:
+    """The running proxy container's id, or None."""
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}} {{.Id}}", f"{COMPOSE_PROJECT}-proxy-1"],
                         capture_output=True, text=True)
-    return r.returncode == 0 and r.stdout.strip() == "true"
+    running, _, cid = r.stdout.strip().partition(" ")
+    return cid if r.returncode == 0 and running == "true" else None
 
 
 def refresh_own_ip_deny(cfg: dict) -> bool:
@@ -398,7 +402,38 @@ def extract_marked_json(log_text: str, max_bytes: int) -> bytes:
     return body.encode()
 
 
-def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | None = None) -> bytes:
+COOKIE_FILE = "clearances.json"
+COOKIE_MAX_BYTES = 256 * 1024
+
+
+def cookie_dir(cfg: dict, route: str) -> Path | None:
+    """With keep_cookies, the Cloudflare clearances the sandbox's WebView earns are kept between
+    runs, one folder per route (they're bound to the IP they were earned from), as the app keeps
+    its cookies. The host never parses the file; it only keeps the folder down to that one file."""
+    if not cfg.get("keep_cookies"):
+        return None
+    d = Path(cfg.get("cookie_dir") or state_path(cfg).parent).expanduser() / f"cloudflare-{route}"
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o777)  # the sandbox runs as uid 10001
+    tidy_cookie_dir(d)
+    return d
+
+
+def tidy_cookie_dir(d: Path) -> None:
+    for e in d.iterdir():
+        keep = (e.name == COOKIE_FILE and not e.is_symlink() and e.is_file()
+                and e.stat().st_size <= COOKIE_MAX_BYTES)
+        if keep:
+            continue
+        if e.is_dir() and not e.is_symlink():
+            shutil.rmtree(e)
+        else:
+            e.unlink()
+        log(f"removed {e.name!r} from {d.name}")
+
+
+def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | None = None,
+                cookies: Path | None = None) -> bytes:
     image = manifest["nodeImage"]  # e.g. ghcr.io/<owner>/<repo>-node@sha256:...
     validate_node_image(cfg, image)
     verify_image_attestation(cfg, image)
@@ -456,6 +491,8 @@ def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | No
             "--memory", mem, "--pids-limit", pids, "--cpus", cpus]
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
+    if cookies:
+        cmd += ["-v", f"{cookies}:/cf:rw", "-e", "EXT_RUN_CF_DIR=/cf"]
     cmd += ["-v", f"{input_dir}:/input:ro",
             "--name", f"{COMPOSE_PROJECT}-sandbox-run",
             "--",
@@ -472,6 +509,8 @@ def run_sandbox(cfg: dict, manifest: dict, input_dir: Path, proxy_port: int | No
         return extract_marked_json(logs.stdout, MAX_LOG_BYTES)
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        if cookies:
+            tidy_cookie_dir(cookies)
 
 
 def dispatch_ingest(cfg: dict, payload: dict):
@@ -498,7 +537,8 @@ def dispatch_ingest(cfg: dict, payload: dict):
 
 
 def sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date, proxy_port=None) -> dict:
-    payload_bytes = run_sandbox(cfg, manifest, input_dir, proxy_port)
+    route = "direct" if proxy_port == DIRECT_PORT or not cfg.get("upstream_proxy") else "upstream"
+    payload_bytes = run_sandbox(cfg, manifest, input_dir, proxy_port, cookie_dir(cfg, route))
     if len(payload_bytes) > MAX_PAYLOAD_BYTES:
         sys.exit(f"sandbox result is {len(payload_bytes)} bytes, over the {MAX_PAYLOAD_BYTES}-byte cap")
     validated = validate_node_payload(json.loads(payload_bytes), allowed_ids, run_date=run_date)

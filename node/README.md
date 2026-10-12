@@ -251,6 +251,19 @@ another HTTP proxy first, set in the config:
 The proxy's deny rules still apply to every request either way, and nothing about the upstream
 is passed into the sandbox.
 
+### Keeping Cloudflare cookies
+
+`"keep_cookies": true` keeps the `cf_clearance` cookies the sandbox's WebView earns between runs,
+as the app keeps its cookies, so a site that challenged once isn't challenged on every run. They
+live in `cloudflare-upstream/` and `cloudflare-direct/` next to `state_file` (or under
+`cookie_dir`), one folder per route since a clearance is bound to the IP it was earned from. Each
+folder is mounted read-write into the sandbox at `/cf`. The controller never reads the file; after
+every run it deletes anything in the folder that isn't a single `clearances.json` of at most
+256 KB.
+
+This is the one place the sandbox can write something that outlives a run. Leave it off if you'd
+rather keep it fully stateless.
+
 ### Network isolation
 
 `node/compose.yml` creates two Docker networks and a proxy container between them:

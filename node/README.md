@@ -241,9 +241,9 @@ needs no credential; only reporting back does.
 ### Going out through another proxy
 
 By default the proxy goes out directly from this machine. To send the sandbox's traffic through
-another HTTP proxy first, such as a VPN container's built-in one, set in the config:
+another HTTP proxy first, set in the config:
 
-- `upstream_proxy`: `"host:port"` of that proxy, e.g. `"gluetun-node:8888"`;
+- `upstream_proxy`: `"host:port"` of that proxy;
 - `upstream_network`: the Docker network it's on, which the proxy container joins to reach it;
 - `direct_fallback`: `true` to give anything that didn't pass through the upstream one more try
   going out directly, and report that result instead.

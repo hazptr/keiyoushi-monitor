@@ -190,7 +190,7 @@ def compose_files() -> list:
 
 
 def write_upstream(cfg: dict) -> bool:
-    """upstream_proxy ("host:port", e.g. a VPN container's HTTP proxy) sends the sandbox's traffic
+    """upstream_proxy ("host:port" of another HTTP proxy) sends the sandbox's traffic
     through it; upstream_network is the Docker network the proxy joins to reach it. With
     direct_fallback, a second proxy port goes out directly, for a retry of what didn't pass.
     Returns whether the squid side changed."""

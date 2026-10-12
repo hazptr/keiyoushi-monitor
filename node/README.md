@@ -208,6 +208,8 @@ API-incompatible runtime against a bundle it wasn't built for.
    schedule; each run does at most one recheck and exits.
 5. `python3 node/controller.py --config node/controller.config.json --once` to try it by hand
    first.
+   If a fixed node image landed after the day's sweep, `--image ghcr.io/<owner>/<repo>-node@sha256:...`
+   runs that one against the same recheck.json; it goes through the same signature checks.
 
 ### The GitHub App
 

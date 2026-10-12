@@ -546,13 +546,19 @@ def sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date, proxy_port=Non
     return validated
 
 
-def one_pass(cfg: dict, force: bool = False) -> bool:
+def one_pass(cfg: dict, force: bool = False, image: str | None = None) -> bool:
     # Fetch recheck.json ONCE, validate it, and use exactly those bytes from here on — never
     # re-fetch it (or the bundle) a second time to "double check"; a second fetch could silently
     # observe a different (e.g. just-republished) version than the one actually validated.
     manifest_bytes = fetch_bytes(cfg["pages_url"].rstrip("/") + "/recheck.json", max_bytes=2 * 1024 * 1024)
     manifest = json.loads(manifest_bytes)
     validate_recheck_manifest(manifest)
+    if image:
+        # A newer node image for the same run (e.g. a fix landed after the sweep). It still has to
+        # pass validate_node_image() and the attestation check in run_sandbox(), and the image's
+        # own runtime-commit check against recheck.json.
+        log(f"using {image} instead of recheck.json's {manifest['nodeImage']}")
+        manifest = {**manifest, "nodeImage": image}
 
     last = state_path(cfg)
     if not force and last.exists() and last.read_text().strip() == manifest["runId"]:
@@ -618,13 +624,14 @@ def main():
     ap.add_argument("--config", required=True, type=Path)
     ap.add_argument("--once", action="store_true", help="process even if this runId was already handled")
     ap.add_argument("--teardown", action="store_true", help="stop the proxy/sandbox networks and exit")
+    ap.add_argument("--image", help="run this node image (ghcr.io/<owner>/<repo>-node@sha256:...) instead of the one recheck.json names")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     if args.teardown:
         teardown(cfg)
         return
-    one_pass(cfg, force=args.once)
+    one_pass(cfg, force=args.once, image=args.image)
 
 
 if __name__ == "__main__":

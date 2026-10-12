@@ -20,10 +20,10 @@ caller, since this script is the one place that knows both the old and the new r
 """
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 
 
 def sha256_of(path: str) -> str:
@@ -59,41 +59,57 @@ def main():
         sys.exit(f"checksum mismatch: expected {expected_sha}, got {actual}; refusing to extract")
 
     dest_root = os.path.realpath(dest_root)
-    with tempfile.TemporaryDirectory() as tmp:
-        decompressed = os.path.join(tmp, "bundle.tar")
-        # zstd isn't a stdlib codec; shell out to the `zstd` binary the image ships, same as the
-        # pack side.
-        with open(decompressed, "wb") as out:
-            subprocess.run(["zstd", "-d", "-T0", "-c", bundle], check=True, stdout=out)
-        with tarfile.open(decompressed) as tf:
-            members = tf.getmembers()
-            for m in members:
-                # GNU tar itself turns a second occurrence of the same (device, inode) — e.g. a
-                # dependency jar/class dir shared by several of the recheck subset's extensions —
-                # into a hardlink entry pointing back at the first one. That's tar's own space
-                # saving, not something pack-recheck-bundle.sh asked for, and it's not a path
-                # escape: the link TARGET is itself just another member's name, so it gets the
-                # exact same path validation as every other member. Symlinks are refused outright
-                # — their target is a free-form string, not bound to an in-archive member at all —
-                # and so is anything that isn't a plain file, directory, or in-archive hardlink.
-                if m.issym():
-                    sys.exit(f"refusing to extract symlink member: {m.name}")
-                if not (m.isfile() or m.isdir() or m.islnk()):
-                    sys.exit(f"refusing to extract non-regular member: {m.name}")
-                if not is_safe_member(m.name, dest_root):
-                    sys.exit(f"refusing to extract unsafe member path: {m.name}")
-                if m.islnk() and not is_safe_member(m.linkname, dest_root):
-                    sys.exit(f"refusing to extract hardlink with an unsafe target: {m.name} -> {m.linkname}")
+    # Streamed straight from zstd, one member at a time: the unpacked tar is hundreds of MB, far
+    # over the sandbox's per-file size limit, but no single member is. zstd isn't a stdlib codec;
+    # shell out to the `zstd` binary the image ships, same as the pack side.
+    proc = subprocess.Popen(["zstd", "-d", "-T0", "-c", bundle], stdout=subprocess.PIPE)
+    count = 0
+    with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
+        for m in tf:
+            count += 1
+            # GNU tar itself turns a second occurrence of the same (device, inode) — e.g. a
+            # dependency jar/class dir shared by several of the recheck subset's extensions —
+            # into a hardlink entry pointing back at the first one. That's tar's own space
+            # saving, not something pack-recheck-bundle.sh asked for, and it's not a path
+            # escape: the link TARGET is itself just another member's name, so it gets the
+            # exact same path validation as every other member. Symlinks are refused outright
+            # — their target is a free-form string, not bound to an in-archive member at all —
+            # and so is anything that isn't a plain file, directory, or in-archive hardlink.
+            # A refusal partway leaves a partial tree in the sandbox's throwaway /work; the run
+            # stops there either way.
+            if m.issym():
+                sys.exit(f"refusing to extract symlink member: {m.name}")
+            if not (m.isfile() or m.isdir() or m.islnk()):
+                sys.exit(f"refusing to extract non-regular member: {m.name}")
+            if not is_safe_member(m.name, dest_root):
+                sys.exit(f"refusing to extract unsafe member path: {m.name}")
+            if m.islnk() and not is_safe_member(m.linkname, dest_root):
+                sys.exit(f"refusing to extract hardlink with an unsafe target: {m.name} -> {m.linkname}")
             # Python's own tarfile "data" extraction filter (3.12+) is a second, independent
             # layer of the same no-absolute/no-".." rule enforced above. Hard-fail rather than
-            # silently falling back to the unfiltered extractall() on an older Python — this
-            # image pins its own Python version, so hitting this means that pin drifted, not
-            # that it's safe to proceed without the second layer of defense.
+            # silently extracting unfiltered on an older Python — this image pins its own
+            # Python version, so hitting this means that pin drifted.
+            if m.islnk():
+                # tarfile can't make a hardlink in stream mode without seeking back, so link (or,
+                # across filesystems, copy) the already-extracted, already-validated target.
+                src, dst = os.path.join(dest_root, m.linkname), os.path.join(dest_root, m.name)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.lexists(dst):
+                    if os.path.samefile(src, dst):
+                        continue  # the same path packed twice: tar's second copy links to the first
+                    os.unlink(dst)
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    shutil.copyfile(src, dst)
+                continue
             try:
-                tf.extractall(dest_root, members=members, filter="data")
+                tf.extract(m, dest_root, filter="data")
             except TypeError:
-                sys.exit("this Python has no tarfile extractall(filter=...) (needs 3.12+); "
+                sys.exit("this Python has no tarfile extract(filter=...) (needs 3.12+); "
                           "refusing to extract without it")
+    if proc.wait() != 0:
+        sys.exit(f"zstd exited {proc.returncode} decompressing the bundle")
 
     # Rewrite classpath.txt absolute paths onto dest_root — each original absolute path "/x/y"
     # became the member "x/y" under dest_root, so the rewrite is purely mechanical: prefix every
@@ -108,7 +124,7 @@ def main():
         if new_lines != lines:
             open(p, "w").write("\n".join(new_lines) + ("\n" if new_lines else ""))
             rewritten += 1
-    print(f"extracted {bundle} -> {dest_root} ({len(members)} member(s)), checksum verified; "
+    print(f"extracted {bundle} -> {dest_root} ({count} member(s)), checksum verified; "
           f"rewrote {rewritten} classpath.txt file(s)")
 
 

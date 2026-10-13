@@ -567,13 +567,19 @@ def sandbox_pass(cfg, manifest, input_dir, allowed_ids, run_date, proxy_port=Non
     for (_, _, shard_ids), payload_bytes in zip(shards, payloads):
         if len(payload_bytes) > MAX_PAYLOAD_BYTES:
             sys.exit(f"sandbox result is {len(payload_bytes)} bytes, over the {MAX_PAYLOAD_BYTES}-byte cap")
-        v = validate_node_payload(json.loads(payload_bytes), shard_ids & allowed_ids, run_date=run_date)
+        payload = json.loads(payload_bytes)
+        # Each sandbox stamps the date it finished; a long recheck can cross midnight UTC.
+        stamped = payload.get("runDate") if isinstance(payload, dict) else None
+        today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+        if not isinstance(stamped, str) or not run_date <= stamped <= today:
+            sys.exit(f"a sandbox reported runDate {stamped!r}, outside {run_date}..{today}; refusing")
+        v = validate_node_payload(payload, shard_ids & allowed_ids, run_date=stamped)
         if v["runId"] != manifest["runId"]:
             sys.exit(f"a sandbox reported run {v['runId']}, not {manifest['runId']}; refusing")
         run_id = v["runId"]
         results += v["results"]
     log(f"validated {len(results)} row(s) for run {run_id}")
-    return {**v, "results": results}
+    return {**v, "runDate": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"), "results": results}
 
 
 RUNTIME_PATHS = ("harness/runtime/", "harness/ci/build-runtime.sh")
@@ -673,6 +679,7 @@ def one_pass(cfg: dict, force: bool = False, image: str | None = None) -> bool:
                 direct = sandbox_pass(cfg, manifest, input_dir, set(retry), run_date, DIRECT_PORT)
                 by_id = {r["id"]: r for r in direct["results"]}
                 validated["results"] = [by_id.get(r["id"], r) for r in validated["results"]]
+                validated["runDate"] = direct["runDate"]
                 passed = sum(r["category"] == "pass" for r in direct["results"])
                 log(f"direct retry: {passed} of {len(retry)} passed")
 

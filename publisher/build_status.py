@@ -46,7 +46,13 @@ BLOCK_TAGS = [
 OPS = ["browse", "latest", "search", "details", "chapters", "read", "pages"]
 LEGACY_STEPS = {"popular": "browse", "manga": "details", "pages": "read", "images": "pages"}
 RUNS_KEPT = 90
-CODES = {"pass": "p", "partial": "a", "fail": "f", "maybe": "m", "untestable": "u", "unsupported": "n"}
+# One letter per run per extension. Keep every letter outside 0-9a-f: a long enough streak of hex
+# letters reads as a Cloudflare ray id, which the publish scrub then replaces.
+CODES = {"pass": "p", "partial": "t", "fail": "x", "maybe": "m", "untestable": "u", "unsupported": "n"}
+# A 16-run streak of the old fail/partial letters scrubbed to "[ray]", with the runs it swallowed
+# padded back as "-" once the string was next rebuilt.
+SCRUBBED_STREAK = re.compile(r"\[ray\]-{0,11}")
+OLD_CODES = str.maketrans("fa", "xt")
 STATUSES = ("pass", "partial", "fail", "maybe", "untestable", "unsupported", "pending")
 
 
@@ -202,6 +208,12 @@ def entry(ext_source_dir, json_dir, config_dir, ext: str, status: str, summary: 
     return pub
 
 
+def upgrade_history(codes: str) -> str:
+    """Move a published history string to the current letters, restoring scrubbed streaks as
+    fails: partial was the only other letter in them, and which one it was is gone."""
+    return SCRUBBED_STREAK.sub("f" * 16, codes).translate(OLD_CODES)
+
+
 def read_tsv(path: Path) -> dict:
     """ext -> (status, secs, summary, via)."""
     rows = {}
@@ -271,7 +283,7 @@ def build(args) -> dict:
     counts = {s: sum(x["status"] == s for x in exts) for s in STATUSES}
 
     runs = (prev or {}).get("history", {}).get("runs", [])
-    ext_hist = (prev or {}).get("history", {}).get("ext", {})
+    ext_hist = {eid: upgrade_history(codes) for eid, codes in (prev or {}).get("history", {}).get("ext", {}).items()}
     ext_hist_wide = {eid: dict(zip(runs, codes)) for eid, codes in ext_hist.items()}
     if not args.progress and date not in runs:
         runs = (runs + [date])[-RUNS_KEPT:]

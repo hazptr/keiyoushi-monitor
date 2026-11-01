@@ -110,4 +110,20 @@ with tempfile.TemporaryDirectory() as tmp:
 if FAILURES:
     print(f"\n{len(FAILURES)} failure(s): {FAILURES}", file=sys.stderr)
     sys.exit(1)
+# 15. Run-history strings never look like a ray id, whatever the streak.
+from build_status import CODES, upgrade_history  # noqa: E402
+for status, code in CODES.items():
+    streak = code * 16
+    check(f"a 16-run {status} streak survives the scrub", scrub_text(streak) == streak)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "status.json").write_text(json.dumps({"ext": {"en/x": streak}}))
+        check(f"a 16-run {status} streak passes leak_check", leak_check(root) == [])
+
+# 16. History the old letters published upgrades in place, scrubbed streaks restored by position.
+check("old letters upgrade", upgrade_history("pfa-mun") == "pxt-mun")
+check("a padded scrubbed streak regains its runs", upgrade_history("[ray]" + "-" * 11 + "ffff") == "x" * 20)
+check("an unpadded scrubbed streak regains its runs", upgrade_history("pppp[ray]") == "pppp" + "x" * 16)
+check("upgrading twice changes nothing", upgrade_history(upgrade_history("[ray]pf")) == "x" * 16 + "px")
+
 print("\nok: all scrub/leak-check tests passed")

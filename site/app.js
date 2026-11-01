@@ -55,7 +55,7 @@ const OPS = {
   pages: ['Load pages', 'Pages don’t load'],
 }
 const OP_STATUS = { pass: 'Works', fail: 'Fails', maybe: 'Turned away', skip: 'Not checked', untestable: 'Couldn’t check', na: 'Not applicable' }
-const FROM_CODE = { p: 'pass', a: 'partial', f: 'fail', m: 'maybe', u: 'untestable', n: 'unsupported' }
+const FROM_CODE = { p: 'pass', t: 'partial', x: 'fail', m: 'maybe', u: 'untestable', n: 'unsupported' }
 const ISSUES = 'https://github.com/keiyoushi/extensions-source/issues'
 
 let DATA = null

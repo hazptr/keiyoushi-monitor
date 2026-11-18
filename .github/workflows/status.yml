@@ -389,6 +389,7 @@ jobs:
             --site proto/site \
             --out public \
             --overrides proto/untestable-sources.tsv \
+            --config-dir proto/config \
             --previous-status previous-status.json \
             --kei-commit "$KEI_COMMIT" \
             --run-id "$RUN_ID"

@@ -1,0 +1,2 @@
+not_applicable = ["latest"]
+not_applicable_reason = "The site's only full list is already newest first; it is used as Popular."

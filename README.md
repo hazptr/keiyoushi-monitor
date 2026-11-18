@@ -109,7 +109,10 @@ can't recover the handful of sources that only pass from a residential-looking a
   (`node/seccomp/`), systemd/cron examples. See [`node/README.md`](node/README.md).
 - `site/` — the static page (`index.html`/`app.js`/`style.css`).
 - `untestable-sources.tsv` — sources that can't be smoke-tested at all (self-hosted software like
-  Komga/LANraragi) and the reason shown on the page, instead of a failure.
+  Komga/LANraragi, Japan-only sites) and the reason shown on the page, instead of a failure.
+- `config/<lang>_<name>.toml` — per-source settings: `not_applicable` (operations the source
+  doesn't have, such as search on a site without one, shown as not applicable instead of failing),
+  `not_applicable_reason`, and `smoke_url` (a title to test, for sources with no lists to pick from).
 - `ci-sample.txt` (a 100-extension sample for test runs; `status.yml` checks every extension when `extensions_file` is blank) / `ci-tiny.txt` — extension-list
   inputs for test runs.
 

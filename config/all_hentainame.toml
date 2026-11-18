@@ -1,0 +1,2 @@
+not_applicable = ["latest"]
+not_applicable_reason = "The site lists galleries by date only, so there is no separate latest listing."

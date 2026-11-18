@@ -1,0 +1,3 @@
+not_applicable = ["browse", "latest", "search"]
+not_applicable_reason = "Cubari lists your own reading history, so there's nothing to list for a new user. Links open fine."
+smoke_url = "https://cubari.moe/read/imgur/dDucgQx/"

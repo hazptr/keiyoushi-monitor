@@ -58,12 +58,18 @@ VERBOSE_FLAG=()
 # harness code change needed for the proxy itself.
 read -ra EXTRA_OPTS <<<"${EXT_RUN_JAVA_EXTRA_OPTS:-}"
 
+# config/<lang>_<name>.toml may pin a title to test (smoke_url), for sources with no lists to
+# pick one from (Cubari). Absent (e.g. on a recheck node) = the smoke run picks one itself.
+CONF=$HERE/../../config/${SRC//\//_}.toml
+SMOKE_URL=
+[ -f "$CONF" ] && SMOKE_URL=$(sed -n 's/^smoke_url *= *"\([^"]*\)".*/\1/p' "$CONF" | head -1)
+
 echo "[run-smoke] running $SRC (smoke, --direct, chrome WebView)" >&2
 set +e
 EXT_RUN_DATA="$DATA" EXT_RUN_WEBVIEW_SOCK="$WV_SOCK" \
   "${EXT_RUN_JAVA_BIN:-java}" -XX:+UnlockDiagnosticVMOptions -XX:-BytecodeVerificationRemote -XX:TieredStopAtLevel=1 -Xshare:auto \
   "${EXTRA_OPTS[@]}" \
-  -cp "$CP" keiyoushi.extrun.MainKt --class "$CLASS" --direct --browser chrome --json smoke "${VERBOSE_FLAG[@]}" \
+  -cp "$CP" keiyoushi.extrun.MainKt --class "$CLASS" --direct --browser chrome --json smoke ${SMOKE_URL:+"$SMOKE_URL"} "${VERBOSE_FLAG[@]}" \
   >"${OUT:-/dev/stdout}" 2>"$DATA/stderr.log"
 rc=$?
 set -e

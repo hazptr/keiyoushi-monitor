@@ -1,0 +1,2 @@
+not_applicable = ["latest"]
+not_applicable_reason = "Single-series site; the homepage is the series page and there is no latest listing."

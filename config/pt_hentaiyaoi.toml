@@ -1,0 +1,2 @@
+not_applicable = ["latest"]
+not_applicable_reason = "The site lists posts newest first only, so that list is Popular."

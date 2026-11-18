@@ -1,0 +1,2 @@
+not_applicable = ["read", "pages"]
+not_applicable_reason = "Chapters need a site login, which the test harness doesn't have"

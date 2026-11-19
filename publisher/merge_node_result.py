@@ -34,11 +34,11 @@ STEP_TEXT = {
 def category_text(row: dict) -> str | None:
     cat = row["category"]
     if cat == "fail":
-        return f"Also fails from our recheck node: {STEP_TEXT.get(row.get('step'), 'something in it is broken')}"
+        return f"Also fails through our recheck proxies: {STEP_TEXT.get(row.get('step'), 'something in it is broken')}"
     if cat == "blocked":
-        return "Also blocked from our recheck node"
+        return "Also blocked through our recheck proxies"
     if cat == "cloudflare":
-        return "Cloudflare still blocks our recheck node"
+        return "Cloudflare still blocks our recheck proxies"
     return None
 
 
@@ -92,11 +92,14 @@ def merge(status_data: dict, node_payload: dict, run_date: str | None = None) ->
             x["error"] = category_text(row)
             x["tags"] = ["cloudflare"]
         x["recheckedOnNode"] = True
+        x.pop("recheckedFrom", None)
+        if row.get("cc"):
+            x["recheckedFrom"] = row["cc"]
         if run_date:
             x["recheckedOn"] = run_date
         if row.get("warning") == "cloudflare checkbox clicked":
             notes = x.setdefault("notes", [])
-            tag = "Our recheck node had to click Cloudflare's verification checkbox"
+            tag = "Our recheck proxy run had to click Cloudflare's verification checkbox"
             if tag not in notes:
                 notes.append(tag)
         applied += 1

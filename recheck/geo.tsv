@@ -1,0 +1,6 @@
+# Sources that only work from particular countries: <lang>/<name> TAB country codes (ISO 3166,
+# comma-separated, most wanted first). harness/ci/recheck.py sends these to a proxy in that
+# country first. Languages tied to one country (vi, id, th, ko, ja, tr, ...) already default to
+# it there; list a source here only when it wants something else, or when its language doesn't
+# say (en, es, pt, ar, fr, zh, all).
+pt/kuromangas	BR

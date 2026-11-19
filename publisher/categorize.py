@@ -15,14 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-# In the repo checkout this is ../publisher/node_schema.py; in the built node image (see
-# node/Dockerfile) it's copied in at /app/publisher/node_schema.py alongside this script at
-# /app/categorize.py.
-_here = Path(__file__).resolve().parent
-for _candidate in (_here.parent / "publisher", _here / "publisher"):
-    if (_candidate / "node_schema.py").exists():
-        sys.path.insert(0, str(_candidate))
-        break
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from node_schema import validate_node_payload  # noqa: E402
 
 BLOCKED = re.compile(r"\b(?:40[13]|429)\b")

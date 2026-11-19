@@ -1,0 +1,14 @@
+# Variant: send this proxy's traffic through another HTTP proxy (a VPN exit such as gluetun's
+# HTTP proxy) instead of straight out of the host's own connection.
+#
+#   KMON_UPSTREAM_NETWORK=kei-node-upstream KMON_SQUID_LOCAL=/path/to/upstream.conf \
+#     docker compose -p kmon-pia -f proxy/compose.yml -f proxy/compose.upstream.yml up -d
+#
+# upstream.conf is a Squid include along the lines of upstream.example.conf.
+services:
+  tailscale:
+    networks: [upstream]
+networks:
+  upstream:
+    external: true
+    name: ${KMON_UPSTREAM_NETWORK:?set KMON_UPSTREAM_NETWORK (the Docker network the upstream proxy is on)}

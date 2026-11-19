@@ -4,7 +4,7 @@ consumed by the `sweep` and `publish` jobs).
 
 Both `build-all.sh` (packer) and this script agree on a fixed, relative archive layout — no
 member is ever an absolute path, and this script re-validates that independently before writing
-anything to disk (same two-layer approach as node/extract_bundle.py for the recheck bundle):
+anything to disk (two independent layers):
 
     wt/<relative path under the extensions-source checkout>
     gradle/<relative path under $GRADLE_USER_HOME/caches>

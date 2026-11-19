@@ -1,0 +1,41 @@
+# One recheck proxy: a Tailscale node plus Squid sharing its network namespace. The sweep's
+# recheck jobs (GitHub-hosted runners, tagged tag:kmon-ci) join the tailnet for the length of the
+# job and send their traffic here; nothing else can reach it. No open ports, no root on the host:
+# Tailscale runs in userspace mode and connects out, so it works behind NAT/CGNAT.
+#
+#   KMON_PROXY_NAME=kmon-vn TS_AUTHKEY=tskey-auth-... docker compose -p kmon-vn -f proxy/compose.yml up -d
+#
+# TS_AUTHKEY is only needed on the very first start (the node's identity is kept in the `state`
+# volume after that). Squid listens on 127.0.0.1 inside the shared namespace, so it is reachable
+# only through Tailscale, never from the Docker network the egress leg sits on.
+# Optional: KMON_SQUID_LOCAL points at an extra Squid include (an upstream cache_peer, see
+# compose.upstream.yml); KMON_OWN_IP_CONF at the file refresh-own-ip.sh writes.
+name: ${KMON_PROXY_NAME:?set KMON_PROXY_NAME (the proxy's tailnet hostname, e.g. kmon-vn)}
+
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.104.7@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
+    hostname: ${KMON_PROXY_NAME}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${KMON_PROXY_NAME}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_EXTRA_ARGS: --advertise-tags=tag:kmon-proxy
+    volumes:
+      - state:/var/lib/tailscale
+    restart: unless-stopped
+
+  squid:
+    image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+      - ${KMON_SQUID_LOCAL:-./empty.conf}:/etc/squid/local.conf:ro
+      - ${KMON_OWN_IP_CONF:-./empty.conf}:/etc/squid/own-ip.conf:ro
+    restart: unless-stopped
+
+volumes:
+  state: {}

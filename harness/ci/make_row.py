@@ -3,7 +3,7 @@
 ext, status (pass|fail|untestable|error), secs, summary, via.
 
 This row's summary is GitHub-hosted-sweep free text (scrubbed, but still free text — a recheck
-*node*'s output never goes through this script at all; see node/categorize.py, which only ever
+*node*'s output never goes through this script at all; see publisher/categorize.py, which only ever
 emits a fixed category, never a message built from error text). Scrub BEFORE truncating: an IP or
 ray ID can sit past the 200-char cut point of a long exception message, so truncating first can
 leave a leak; this file always calls scrub_text() first, then slices.

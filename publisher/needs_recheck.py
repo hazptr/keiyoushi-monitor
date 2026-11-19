@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """classify job: read merged results.tsv, decide which failures look IP/network-shaped rather
-than extension-shaped, and write the list of extensions worth a recheck node's attention.
+than extension-shaped, and write the list of extensions worth a recheck through the proxies.
 
   needs_recheck.py <results.tsv> <out-file> [max]
 
 The BLOCKISH pattern: a failure that could be about the caller's IP (Cloudflare, rate limits,
 connect/TLS/timeouts) is worth retrying from a different network; anything else will fail the
-same way everywhere, so there's no point asking a recheck node to try it too.
+same way everywhere, so there's no point rechecking it.
 
-Every id this script writes out eventually becomes a path component on the node side
-(pack-recheck-bundle.sh, extract_bundle.py) and a GitHub Actions workflow_dispatch input, so it's
-validated against the same EXT_ID_RE node_schema.py and pack-recheck-bundle.sh use — a malformed
+Every id this script writes out becomes a path component in the recheck job, so it's
+validated against node_schema.py's EXT_ID_RE — a malformed
 or path-traversal-shaped id from a corrupted/edited results.tsv is dropped here rather than
 carried forward.
 """

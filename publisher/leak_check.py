@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Shared scrubbing/leak-check primitives used by the `publish` job (scrub whatever lands in
-status.json) and as a backstop for anything a recheck node reports (see node/categorize.py,
+status.json) and as a backstop for anything a recheck reports (see publisher/categorize.py,
 which turns a raw smoke result into a category-only row before it ever leaves the sandbox — this
 module exists for the GitHub-hosted side's free text and as a last line of defense, not as the
 thing that makes node output safe)."""

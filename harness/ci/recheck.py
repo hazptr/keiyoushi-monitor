@@ -6,9 +6,9 @@
 Runs in the sweep shard right after its own run, on the same GitHub-hosted runner, once that
 runner has joined the tailnet as tag:kmon-ci (the tailscale/github-action step before this).
 The proxies are every online tailnet peer tagged tag:kmon-proxy, plus any public proxies in the
-RECHECK_PROXIES secret: a JSON list of {"name": ..., "url": "http://[user:pass@]host:port"}.
-A public proxy with a login goes through proxy_chain.py on 127.0.0.1, since Chrome and the JVM
-can't send proxy credentials themselves. Each proxy's exit country and time zone are measured
+RECHECK_PROXIES secret: a JSON list of {"name": ..., "url": "http://[user:pass@]host:port"} (or
+socks5://). A SOCKS5 proxy, or an HTTP one with a login, goes through proxy_chain.py on 127.0.0.1,
+since Chrome and the JVM can't send proxy credentials (and the JVM only speaks HTTP proxy). Each proxy's exit country and time zone are measured
 through the proxy itself at the start, so a proxy's location is never taken on trust.
 
 Each extension goes to the proxies in this order: those in a country it prefers (recheck/geo.tsv,
@@ -97,10 +97,10 @@ def public_proxies() -> list[dict]:
         for secret in {url, u.hostname or "", u.password or "", u.username or ""} - {""}:
             print(f"::add-mask::{secret}")
         name = re.sub(r"[^a-z0-9-]", "-", str(e.get("name") if isinstance(e, dict) and e.get("name") else f"public-{i + 1}").lower())
-        if u.scheme != "http" or not u.hostname:
-            log(f"{name}: only http:// proxies are supported; skipping")
+        if u.scheme not in ("http", "socks5", "socks5h") or not u.hostname:
+            log(f"{name}: only http:// and socks5:// proxies are supported; skipping")
             continue
-        if u.username:
+        if u.username or u.scheme != "http":
             port = free_port()
             subprocess.Popen([sys.executable, str(HERE / "proxy_chain.py"), str(port)],
                              env={**os.environ, "CHAIN_UPSTREAM": url},

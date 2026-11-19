@@ -1,0 +1,13 @@
+# Recheck test: sources the old node usually rescued, plus vi ones still blocked from it.
+vi/sayhentai
+en/hivescans
+en/girlstop
+fr/mangasoriginesfr
+fr/blossomscans
+zh/hanime1
+id/westmanga
+tr/eldermanga
+en/luascans
+vi/truyenqq
+vi/nettruyenx
+vi/goctruyentranh

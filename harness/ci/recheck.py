@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Recheck a sweep shard's blocked-looking failures through the recheck proxies on the tailnet.
+"""Recheck a sweep shard's blocked-looking failures through the recheck proxies.
 
     recheck.py <extensions-source> <runtime-dist> <shard-file> <run-id> <work-dir> <out.json>
 
 Runs in the sweep shard right after its own run, on the same GitHub-hosted runner, once that
 runner has joined the tailnet as tag:kmon-ci (the tailscale/github-action step before this).
-Every online peer tagged tag:kmon-proxy is a proxy; each one's exit country and time zone are measured
+The proxies are every online tailnet peer tagged tag:kmon-proxy, plus any public proxies in the
+RECHECK_PROXIES secret: a JSON list of {"name": ..., "url": "http://[user:pass@]host:port"}.
+A public proxy with a login goes through proxy_chain.py on 127.0.0.1, since Chrome and the JVM
+can't send proxy credentials themselves. Each proxy's exit country and time zone are measured
 through the proxy itself at the start, so a proxy's location is never taken on trust.
 
 Each extension goes to the proxies in this order: those in a country it prefers (recheck/geo.tsv,
@@ -16,13 +19,17 @@ connect); a real failure is the same from anywhere. A pass anywhere is a pass.
 
 Output is the category-only payload publisher/categorize.py defines (no raw text, safe for a public
 artifact), each pass carrying the country it passed from as `cc`. The console only ever shows
-proxy hostnames, countries and per-extension status words: never an exit IP, never error text.
+proxy names, countries and per-extension status words: never an exit IP or a proxy URL, never
+error text.
 """
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -44,9 +51,12 @@ def log(msg: str) -> None:
 
 
 def discover() -> list[dict]:
-    out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return []  # not on the tailnet this run (only public proxies)
     if out.returncode != 0:
-        log("tailscale status failed; no proxies")
+        log("tailscale status failed; no tailnet proxies")
         return []
     peers = (json.loads(out.stdout).get("Peer") or {}).values()
     found = []
@@ -55,7 +65,46 @@ def discover() -> list[dict]:
             continue
         v4 = [ip for ip in p.get("TailscaleIPs") or [] if "." in ip]
         if v4:
-            found.append({"name": p.get("HostName") or p.get("DNSName", "?"), "ip": v4[0]})
+            found.append({"name": p.get("HostName") or p.get("DNSName", "?"), "host": v4[0], "port": PROXY_PORT})
+    return found
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def public_proxies() -> list[dict]:
+    """RECHECK_PROXIES, masked in the job log before anything else touches it. A proxy with a
+    login gets its own proxy_chain.py front; one without is used as is."""
+    raw = os.environ.get("RECHECK_PROXIES", "").strip()
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        print("::warning::RECHECK_PROXIES isn't valid JSON; ignoring it")
+        return []
+    found = []
+    for i, e in enumerate(entries if isinstance(entries, list) else []):
+        url = e.get("url", "") if isinstance(e, dict) else str(e)
+        u = urllib.parse.urlsplit(url)
+        for secret in {url, u.hostname or "", u.password or "", u.username or ""} - {""}:
+            print(f"::add-mask::{secret}")
+        name = re.sub(r"[^a-z0-9-]", "-", str(e.get("name") if isinstance(e, dict) and e.get("name") else f"public-{i + 1}").lower())
+        if u.scheme != "http" or not u.hostname:
+            log(f"{name}: only http:// proxies are supported; skipping")
+            continue
+        if u.username:
+            port = free_port()
+            subprocess.Popen([sys.executable, str(HERE / "proxy_chain.py"), str(port)],
+                             env={**os.environ, "CHAIN_UPSTREAM": url},
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+            found.append({"name": name, "host": "127.0.0.1", "port": port})
+        else:
+            found.append({"name": name, "host": u.hostname, "port": u.port or 8080})
     return found
 
 
@@ -64,7 +113,7 @@ def probe(proxy: dict) -> dict | None:
     are requested, so the exit IP never even reaches this process."""
     url = "http://ip-api.com/json/?fields=status,countryCode,timezone"
     for _ in range(2):
-        r = subprocess.run(["curl", "-sS", "--max-time", "20", "-x", f"http://{proxy['ip']}:{PROXY_PORT}", url],
+        r = subprocess.run(["curl", "-sS", "--max-time", "20", "-x", f"http://{proxy['host']}:{proxy['port']}", url],
                            capture_output=True, text=True)
         try:
             data = json.loads(r.stdout)
@@ -111,15 +160,15 @@ def run_group(proxy: dict, exts: list[str], wt: str, dist: str, out: Path, run_i
     out.mkdir(parents=True, exist_ok=True)
     shard = out / "shard.txt"
     shard.write_text("\n".join(exts) + "\n")
-    url = f"http://{proxy['ip']}:{PROXY_PORT}"
+    url = f"http://{proxy['host']}:{proxy['port']}"
     env = {**os.environ,
            "EXT_RUN_QUIET": "1",
            "EXT_RUN_VIA": "proxy",
            "EXT_RUN_WV_PROXY": url,
            "EXT_RUN_TZ": proxy["tz"],
            "EXT_RUN_JAVA_EXTRA_OPTS": (f"{os.environ.get('EXT_RUN_JAVA_EXTRA_OPTS', '')} "
-                                       f"-Dhttps.proxyHost={proxy['ip']} -Dhttps.proxyPort={PROXY_PORT} "
-                                       f"-Dhttp.proxyHost={proxy['ip']} -Dhttp.proxyPort={PROXY_PORT} ").strip()}
+                                       f"-Dhttps.proxyHost={proxy['host']} -Dhttps.proxyPort={proxy['port']} "
+                                       f"-Dhttp.proxyHost={proxy['host']} -Dhttp.proxyPort={proxy['port']} ").strip()}
     log(f"{len(exts)} extension(s) via {proxy['name']} ({proxy['cc']})")
     stop_webview()
     subprocess.run([str(HERE / "run-shard.sh"), wt, dist, str(shard), str(out)], env=env)
@@ -145,12 +194,15 @@ def main():
         log("nothing to recheck in this shard")
         return
 
-    proxies = [p for p in (probe(p) for p in discover()) if p]
+    candidates = discover() + public_proxies()
+    names = [p["name"] for p in candidates]
+    candidates = [p for i, p in enumerate(candidates) if p["name"] not in names[:i]]  # first of a name wins
+    proxies = [p for p in (probe(p) for p in candidates) if p]
     for p in proxies:
         log(f"proxy {p['name']}: exits in {p['cc']}")
     if not proxies:
         Path(out_path).write_text(json.dumps(payload))
-        print("::warning::no recheck proxy reachable on the tailnet; nothing rechecked")
+        print("::warning::no recheck proxy reachable; nothing rechecked")
         return
 
     geo = load_geo()

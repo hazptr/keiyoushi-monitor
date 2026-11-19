@@ -225,6 +225,8 @@ jobs:
     permissions:
       contents: read
       id-token: write   # only to sign in to Tailscale as tag:kmon-ci for the recheck below
+    env:
+      HAS_PUBLIC_PROXIES: ${{ secrets.RECHECK_PROXIES != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -278,18 +280,18 @@ jobs:
           path: out/
 
       # Recheck, right here: this shard's failures that look like a block (Cloudflare, 403/429,
-      # timeouts, connect errors) go straight back out through the recheck proxies on the tailnet,
-      # each to a proxy in the country it wants first (proxy/README.md). Skipped when nothing
-      # looks blocked or while the TS_CLIENT_ID/TS_AUDIENCE variables are unset. Only the
-      # category-only result is uploaded: the raw logs can carry a proxy's exit IP.
+      # timeouts, connect errors) go straight back out through the recheck proxies (the tailnet's,
+      # and any public ones in the RECHECK_PROXIES secret), each to a proxy in the country it wants
+      # first (proxy/README.md). Skipped when nothing looks blocked or no proxy is configured.
+      # Only the category-only result is uploaded: the raw logs can carry a proxy's exit IP.
       - id: flagged
         name: pick this shard's failures worth a recheck
-        if: always() && vars.TS_CLIENT_ID != ''
+        if: always() && (vars.TS_CLIENT_ID != '' || env.HAS_PUBLIC_PROXIES == 'true')
         run: |
           python3 proto/publisher/needs_recheck.py out/results.tsv recheck-shard.txt 300
           if [ -s recheck-shard.txt ]; then echo "any=1" >> "$GITHUB_OUTPUT"; fi
       - uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
-        if: always() && steps.flagged.outputs.any == '1'
+        if: always() && steps.flagged.outputs.any == '1' && vars.TS_CLIENT_ID != ''
         with:
           oauth-client-id: ${{ vars.TS_CLIENT_ID }}
           audience: ${{ vars.TS_AUDIENCE }}
@@ -301,6 +303,7 @@ jobs:
           EXT_RUN_JAVA_BIN: ${{ env.JAVA_HOME_21_X64 }}/bin/java
           EXT_RUN_PREBUILT: "1"
           RECHECK_PROXY_ORDER: ${{ vars.RECHECK_PROXY_ORDER }}
+          RECHECK_PROXIES: ${{ secrets.RECHECK_PROXIES }}
           RUN_ID: ${{ github.run_id }}
           SHARD: ${{ matrix.shard }}
         run: |

@@ -523,16 +523,6 @@
             legend[i].querySelector('.n').textContent = num(counts[s]);
             legend[i].hidden = !counts[s];
         });
-        // "How it's checked" lives collapsed in the sidebar; links to it open it.
-        const openAbout = () => {
-            $('#about').open = true;
-            $('#about').scrollIntoView({ block: 'nearest' });
-        };
-        for (const a of document.querySelectorAll('a[href="#about"]'))
-            a.addEventListener('click', (e) => {
-                e.preventDefault();
-                openAbout();
-            });
 
         // One section per status, for the grouped view, plus a flat list for the other sorts.
         const groups = Object.fromEntries(
@@ -696,7 +686,6 @@
             }
         });
         apply();
-        if (location.hash === '#about') openAbout();
         if (location.hash.length > 1 && rowById.has(decodeURIComponent(location.hash.slice(1)))) showHash();
         window.addEventListener('hashchange', showHash);
     }

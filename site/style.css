@@ -174,9 +174,7 @@ dl.panel dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFM
 
 .empty { padding: 40px 0; text-align: center; }
 .about { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); }
-.about summary { cursor: pointer; width: fit-content; color: var(--fg); font-weight: 500; }
-.about p { margin: 10px 0 0; max-width: 64ch; }
-.about b { color: var(--fg); font-weight: 500; }
+.about a { color: inherit; }
 
 @media (max-width: 560px) {
   main { padding-top: 32px; }

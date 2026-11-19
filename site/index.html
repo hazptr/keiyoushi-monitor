@@ -26,7 +26,7 @@
       <span class="ptrack"><span class="pfill" id="pfill"></span></span>
     </div>
     <p class="note small">Results can be wrong: sites change, block automated checks or go down for a bit. Check in the
-      app before opening an issue. <a href="#about">How it’s checked</a></p>
+      app before opening an issue.</p>
   </section>
 
 
@@ -50,26 +50,8 @@
     </select>
   </div>
 
-  <details class="about small" id="about">
-    <summary>How it’s checked</summary>
-    <p>Each extension runs on a JVM harness, no phone. It loads popular, opens a manga and its chapter
-      list, loads the newest chapter, then downloads and decodes two pages through the extension’s own
-      client. Anything that fails gets one retry before it counts.</p>
-    <p><b>Partly working</b> means you can still read, but something else (search, latest updates) fails.
-      <b>Might be broken</b> means the site turned our checker away (Cloudflare, a 403, rate limiting), so
-      it could be the site blocking automated checks or the extension itself. The tag says which. The app
-      gets past most Cloudflare checks, so check there.
-      <b>Can’t test</b> means we couldn’t get a result at all, like a self-hosted source or one that needs an account.</p>
-    <p><b>Not checked yet</b> means today’s run hasn’t reached it; the last result is shown instead.
-      <b>Not supported</b> means the extension still uses the older 1.4 extension API, which this checker doesn’t run.</p>
-    <p><b>Notes</b> are things worth knowing that don’t stop reading, like a source repeating titles in its
-      lists or only some titles opening. Before an extension counts as not working, up to three titles get
-      a try, and every failure is checked once more at the end of the run.</p>
-    <p>Some of the checks (page 2 of lists, placeholder images) come from
-      <a href="https://github.com/vetleledaal/keiyoushi-status">vetleledaal’s keiyoushi-status</a>.</p>
-    <p>The small bars on each row are the last two weeks of runs, newest on the right. This runs off main,
-      so it can be ahead of what’s published. Not affiliated with keiyoushi.</p>
-  </details>
+  <p class="about small">Not affiliated with keiyoushi. Some checks (page 2 of lists, placeholder images) come from
+    <a href="https://github.com/vetleledaal/keiyoushi-status">vetleledaal’s keiyoushi-status</a>.</p>
 </aside>
 
 <div class="content">

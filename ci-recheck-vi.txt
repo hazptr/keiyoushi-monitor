@@ -1,0 +1,7 @@
+# Vietnamese sources still blocked from the PIA/WARP pool: the VN proxy test.
+vi/truyenqq
+vi/nettruyenx
+vi/goctruyentranh
+vi/nhattruyen
+vi/toptruyen
+vi/hentaivnx

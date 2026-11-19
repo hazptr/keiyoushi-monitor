@@ -116,7 +116,7 @@ def probe(proxy: dict) -> dict | None:
     """The proxy's exit country + time zone, as the outside world sees it. Only those two fields
     are requested, so the exit IP never even reaches this process."""
     url = "http://ip-api.com/json/?fields=status,countryCode,timezone"
-    for _ in range(2):
+    for attempt in range(4):
         r = subprocess.run(["curl", "-sS", "--max-time", "20", "-x", f"http://{proxy['host']}:{proxy['port']}", url],
                            capture_output=True, text=True)
         try:
@@ -125,7 +125,8 @@ def probe(proxy: dict) -> dict | None:
             data = {}
         if data.get("status") == "success" and len(data.get("countryCode") or "") == 2:
             return {**proxy, "cc": data["countryCode"].upper(), "tz": data.get("timezone") or "UTC"}
-        time.sleep(5)
+        time.sleep(5 * (attempt + 1))
+    log(f"proxy {proxy['name']}: no answer through it; not using it this run")
     return None
 
 

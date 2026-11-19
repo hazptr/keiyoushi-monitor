@@ -40,10 +40,12 @@ proxy, a friend's Squid with a password), without the tailnet: put them in the r
 `RECHECK_PROXIES` as JSON,
 
 ```json
-[{"name": "vn-socks", "url": "socks5://user:pass@host:port"}, {"name": "jp-1", "url": "http://host:port"}]
+[{"name": "vn-socks", "url": "socks5://user:pass@host:port", "geoOnly": true},
+ {"name": "jp-1", "url": "http://host:port"}]
 ```
 
-They're measured and ordered exactly like tailnet proxies (`name` is what `RECHECK_PROXY_ORDER`
+`geoOnly` keeps a proxy to the sources that want its country (someone's personal server, which the
+whole flagged list would get blocked). They're measured and ordered exactly like tailnet proxies (`name` is what `RECHECK_PROXY_ORDER`
 and the job log use). `http://` and `socks5://` proxies (HTTPS sites go through CONNECT). A SOCKS5
 one, or an HTTP one with a login, goes through `harness/ci/proxy_chain.py` on the runner's
 127.0.0.1, because Chrome and the JVM can't send proxy credentials themselves (and the JVM only

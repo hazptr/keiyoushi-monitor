@@ -7,7 +7,8 @@ Runs in the sweep shard right after its own run, on the same GitHub-hosted runne
 runner has joined the tailnet as tag:kmon-ci (the tailscale/github-action step before this).
 The proxies are every online tailnet peer tagged tag:kmon-proxy, plus any public proxies in the
 RECHECK_PROXIES secret: a JSON list of {"name": ..., "url": "http://[user:pass@]host:port"} (or
-socks5://). A SOCKS5 proxy, or an HTTP one with a login, goes through proxy_chain.py on 127.0.0.1,
+socks5://), with "geoOnly": true for a proxy that should only see sources wanting its country
+(someone's own server, where the whole flagged list would get its IP blocked). A SOCKS5 proxy, or an HTTP one with a login, goes through proxy_chain.py on 127.0.0.1,
 since Chrome and the JVM can't send proxy credentials (and the JVM only speaks HTTP proxy). Each proxy's exit country and time zone are measured
 through the proxy itself at the start, so a proxy's location is never taken on trust.
 
@@ -109,6 +110,7 @@ def public_proxies() -> list[dict]:
             found.append({"name": name, "host": "127.0.0.1", "port": port})
         else:
             found.append({"name": name, "host": u.hostname, "port": u.port or 8080})
+        found[-1]["geoOnly"] = bool(isinstance(e, dict) and e.get("geoOnly"))
     return found
 
 
@@ -151,6 +153,7 @@ def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str]) ->
     def rank(p):
         return (wanted.index(p["cc"]) if p["cc"] in wanted else len(wanted),
                 ranking.index(p["name"]) if p["name"] in ranking else len(ranking), shuffle(p))
+    proxies = [p for p in proxies if not p.get("geoOnly") or p["cc"] in wanted]
     head = [p for p in sorted(proxies, key=rank) if p["cc"] in wanted or p["name"] in ranking]
     rest = [p for p in proxies if p not in head]
     plain = sorted((p for p in rest if "warp" not in p["name"]), key=shuffle)

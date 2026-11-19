@@ -72,7 +72,10 @@ runs in the same job), so give them their own login with a spending or bandwidth
    Runners reach the proxies' port 3128 and nothing else; proxies reach nothing on the tailnet.
 3. Settings → Trust credentials (workload identity federation): add an OpenID Connect
    credential for GitHub Actions, issuer `https://token.actions.githubusercontent.com`, subject
-   `repo:<owner>/<repo>:*`, scope `auth_keys` (write) with tag `tag:kmon-ci`. Put its client ID
+   `repo:<owner>/<repo>:*` (or, if the repo uses GitHub's immutable subject,
+   `repo:<owner>@<owner-id>/<repo>@<repo-id>:*`: check
+   `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`), custom claim
+   `job_workflow_ref` = `*/.github/workflows/status.yml@*`, scope `auth_keys` (write) with tag `tag:kmon-ci`. Put its client ID
    and audience in the repo **variables** (not secrets; neither is sensitive) `TS_CLIENT_ID` and
    `TS_AUDIENCE`. No stored secret: each shard signs in with its own short-lived GitHub OIDC token
    and gets an ephemeral node that disappears when the job ends. The recheck is skipped while

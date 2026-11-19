@@ -12,16 +12,20 @@ can't send proxy credentials themselves. Each proxy's exit country and time zone
 through the proxy itself at the start, so a proxy's location is never taken on trust.
 
 Each extension goes to the proxies in this order: those in a country it prefers (recheck/geo.tsv,
-else a default for languages tied to one country, e.g. vi -> VN), then the rest in
-RECHECK_PROXY_ORDER (comma-separated hostnames; unlisted ones after, by name). It moves on to the
+else a default for languages tied to one country, e.g. vi -> VN), then any named in
+RECHECK_PROXY_ORDER (comma-separated), then the rest spread evenly: a stable per-extension shuffle,
+alternating plain VPN exits and WARP exits (a name containing "warp"), so the shards don't all
+pile onto one proxy and a second try leaves from a different kind of network. It moves on to the
 next proxy only while the result still looks like a block (blocked, cloudflare, timeout,
-connect); a real failure is the same from anywhere. A pass anywhere is a pass.
+connect), at most RECHECK_MAX_TRIES (default 3) proxies; a real failure is the same from
+anywhere. A pass anywhere is a pass.
 
 Output is the category-only payload publisher/categorize.py defines (no raw text, safe for a public
 artifact), each pass carrying the country it passed from as `cc`. The console only ever shows
 proxy names, countries and per-extension status words: never an exit IP or a proxy URL, never
 error text.
 """
+import hashlib
 import json
 import os
 import re
@@ -140,11 +144,18 @@ def load_geo() -> dict[str, list[str]]:
 def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str]) -> list[dict]:
     wanted = geo.get(ext) or ([LANG_COUNTRY[ext.split("/")[0]]] if ext.split("/")[0] in LANG_COUNTRY else [])
 
+    def shuffle(p):
+        return hashlib.sha256(f"{ext}|{p['name']}".encode()).hexdigest()
+
     def rank(p):
-        name_rank = ranking.index(p["name"]) if p["name"] in ranking else len(ranking)
-        cc_rank = wanted.index(p["cc"]) if p["cc"] in wanted else len(wanted)
-        return (cc_rank, name_rank, p["name"])
-    return sorted(proxies, key=rank)
+        return (wanted.index(p["cc"]) if p["cc"] in wanted else len(wanted),
+                ranking.index(p["name"]) if p["name"] in ranking else len(ranking), shuffle(p))
+    head = [p for p in sorted(proxies, key=rank) if p["cc"] in wanted or p["name"] in ranking]
+    rest = [p for p in proxies if p not in head]
+    plain = sorted((p for p in rest if "warp" not in p["name"]), key=shuffle)
+    warp = sorted((p for p in rest if "warp" in p["name"]), key=shuffle)
+    mixed = [p for pair in zip(plain, warp) for p in pair] + plain[len(warp):] + warp[len(plain):]
+    return head + mixed
 
 
 def stop_webview() -> None:
@@ -210,7 +221,8 @@ def main():
     orders = {e: proxy_order(e, proxies, geo, ranking) for e in exts}
     final: dict[str, dict] = {}
     pending = list(exts)
-    for rnd in range(len(proxies)):
+    tries = min(len(proxies), max(1, int(os.environ.get("RECHECK_MAX_TRIES") or 3)))
+    for rnd in range(tries):
         if not pending:
             break
         groups: dict[str, list[str]] = {}
@@ -226,7 +238,7 @@ def main():
                 if row["category"] == "pass":
                     row = {**row, "cc": proxy["cc"]}
                 final[e] = row
-                if row["category"] in RETRY_CATEGORIES and rnd + 1 < len(proxies):
+                if row["category"] in RETRY_CATEGORIES and rnd + 1 < tries:
                     still.append(e)
         pending = still
 

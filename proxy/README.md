@@ -40,13 +40,14 @@ proxy, a friend's Squid with a password), without the tailnet: put them in the r
 `RECHECK_PROXIES` as JSON,
 
 ```json
-[{"name": "res-vn", "url": "http://user:pass@host:port"}, {"name": "jp-1", "url": "http://host:port"}]
+[{"name": "vn-socks", "url": "socks5://user:pass@host:port"}, {"name": "jp-1", "url": "http://host:port"}]
 ```
 
 They're measured and ordered exactly like tailnet proxies (`name` is what `RECHECK_PROXY_ORDER`
-and the job log use). Only `http://` proxies, which covers HTTPS sites through CONNECT. One with a
-login goes through `harness/ci/proxy_chain.py` on the runner's 127.0.0.1, because Chrome and the
-JVM can't send proxy credentials themselves; the URL, host and login are masked in the job log.
+and the job log use). `http://` and `socks5://` proxies (HTTPS sites go through CONNECT). A SOCKS5
+one, or an HTTP one with a login, goes through `harness/ci/proxy_chain.py` on the runner's
+127.0.0.1, because Chrome and the JVM can't send proxy credentials themselves (and the JVM only
+speaks HTTP proxy); the URL, host and login are masked in the job log.
 Unlike a tailnet proxy nothing limits who can use their credentials if they leak (extension code
 runs in the same job), so give them their own login with a spending or bandwidth cap.
 

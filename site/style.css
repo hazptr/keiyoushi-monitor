@@ -175,6 +175,8 @@ dl.panel dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFM
 .empty { padding: 40px 0; text-align: center; }
 .about { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); }
 .about a { color: inherit; }
+.about p { margin: 0 0 6px; }
+h1 .logo { width: 26px; height: 26px; border-radius: 6px; vertical-align: -5px; margin-right: 8px; }
 
 @media (max-width: 560px) {
   main { padding-top: 32px; }

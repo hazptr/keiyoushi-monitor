@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The one schema a recheck result is allowed to have. Imported by:
-  - publisher/categorize.py, in each recheck job, to build its output file;
+  - publisher/categorize.py, in each sweep shard's recheck, to build its output file;
   - harness/ci/recheck.py, to validate a shard's combined result before it is uploaded;
   - publisher/merge_recheck.py, in build-site, to re-validate every shard's file before merging.
 

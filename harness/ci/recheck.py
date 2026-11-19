@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Recheck one shard of the day's flagged extensions through the recheck proxies on the tailnet.
+"""Recheck a sweep shard's blocked-looking failures through the recheck proxies on the tailnet.
 
     recheck.py <extensions-source> <runtime-dist> <shard-file> <run-id> <work-dir> <out.json>
 
-Runs on a GitHub-hosted runner that has already joined the tailnet as tag:kmon-ci (the
-tailscale/github-action step before this). Every online peer tagged tag:kmon-proxy is a proxy;
-each one's exit country and time zone are measured through the proxy itself at the start, so a
-proxy's location is never taken on trust.
+Runs in the sweep shard right after its own run, on the same GitHub-hosted runner, once that
+runner has joined the tailnet as tag:kmon-ci (the tailscale/github-action step before this).
+Every online peer tagged tag:kmon-proxy is a proxy; each one's exit country and time zone are measured
+through the proxy itself at the start, so a proxy's location is never taken on trust.
 
 Each extension goes to the proxies in this order: those in a country it prefers (recheck/geo.tsv,
 else a default for languages tied to one country, e.g. vi -> VN), then the rest in
@@ -98,14 +98,12 @@ def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str]) ->
     return sorted(proxies, key=rank)
 
 
-def stop_webview(out: Path) -> None:
-    sock = out / "webview.sock"
-    for pidfile in (Path(f"{sock}.pid"), Path(f"{sock}.xvfb.pid")):
-        try:
-            os.kill(int(pidfile.read_text().strip()), 15)
-        except (OSError, ValueError):
-            pass
-    subprocess.run(["pkill", "-f", "--", "--remote-debugging"], capture_output=True)
+def stop_webview() -> None:
+    """Every run-shard.sh call starts its own WebView sidecar (Xvfb :99 + bridge.py + Chrome) and
+    leaves it running; the next call needs :99 free and a Chrome on the new proxy. Also clears
+    the sweep's own sidecar before the first group."""
+    for pattern in ("--remote-debugging", "webview/nodriver/bridge.py", "Xvfb :99"):
+        subprocess.run(["pkill", "-f", "--", pattern], capture_output=True)
     time.sleep(2)
 
 
@@ -123,8 +121,9 @@ def run_group(proxy: dict, exts: list[str], wt: str, dist: str, out: Path, run_i
                                        f"-Dhttps.proxyHost={proxy['ip']} -Dhttps.proxyPort={PROXY_PORT} "
                                        f"-Dhttp.proxyHost={proxy['ip']} -Dhttp.proxyPort={PROXY_PORT} ").strip()}
     log(f"{len(exts)} extension(s) via {proxy['name']} ({proxy['cc']})")
+    stop_webview()
     subprocess.run([str(HERE / "run-shard.sh"), wt, dist, str(shard), str(out)], env=env)
-    stop_webview(out)
+    stop_webview()
     res = out / "result.json"
     r = subprocess.run([sys.executable, str(ROOT / "publisher" / "categorize.py"), str(out / "results.tsv"),
                         str(out / "json"), run_id, run_date, str(res)], capture_output=True, text=True)

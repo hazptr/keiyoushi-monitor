@@ -25,9 +25,7 @@ env:
   EXTENSIONS_SOURCE_REPO: keiyoushi/extensions-source
   ANDROID_JAVA_VERSION: "17"
   RUNTIME_JAVA_VERSION: "21"
-  RECHECK_MAX_DEFAULT: "450"
-  RECHECK_SHARDS: "8"
-
+  
 permissions:
   contents: read   # publish escalates to write for itself only, below
 
@@ -224,6 +222,9 @@ jobs:
   sweep:
     needs: [build, build-runtime]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # only to sign in to Tailscale as tag:kmon-ci for the recheck below
     strategy:
       fail-fast: false
       matrix:
@@ -276,12 +277,47 @@ jobs:
           name: shard-${{ matrix.shard }}-results
           path: out/
 
+      # Recheck, right here: this shard's failures that look like a block (Cloudflare, 403/429,
+      # timeouts, connect errors) go straight back out through the recheck proxies on the tailnet,
+      # each to a proxy in the country it wants first (proxy/README.md). Skipped when nothing
+      # looks blocked or while the TS_CLIENT_ID/TS_AUDIENCE variables are unset. Only the
+      # category-only result is uploaded: the raw logs can carry a proxy's exit IP.
+      - id: flagged
+        name: pick this shard's failures worth a recheck
+        if: always() && vars.TS_CLIENT_ID != ''
+        run: |
+          python3 proto/publisher/needs_recheck.py out/results.tsv recheck-shard.txt 300
+          if [ -s recheck-shard.txt ]; then echo "any=1" >> "$GITHUB_OUTPUT"; fi
+      - uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        if: always() && steps.flagged.outputs.any == '1'
+        with:
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:kmon-ci
+          hostname: kmon-ci-${{ github.run_id }}-${{ matrix.shard }}
+      - name: recheck through the proxies
+        if: always() && steps.flagged.outputs.any == '1'
+        env:
+          EXT_RUN_JAVA_BIN: ${{ env.JAVA_HOME_21_X64 }}/bin/java
+          EXT_RUN_PREBUILT: "1"
+          RECHECK_PROXY_ORDER: ${{ vars.RECHECK_PROXY_ORDER }}
+          RUN_ID: ${{ github.run_id }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          mkdir -p recheck-out
+          python3 proto/harness/ci/recheck.py extensions-source dist recheck-shard.txt "$RUN_ID" \
+            recheck-work "recheck-out/recheck-${SHARD}.json"
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always() && steps.flagged.outputs.any == '1'
+        with:
+          name: recheck-result-${{ matrix.shard }}
+          path: recheck-out/
+          if-no-files-found: ignore
+
   classify:
     needs: sweep
     runs-on: ubuntu-latest
     if: always()
-    outputs:
-      has_recheck: ${{ steps.recheck.outputs.has_recheck }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -301,13 +337,10 @@ jobs:
             [ -d "$d/json" ] && cp "$d"/json/*.json merged/json/ 2>/dev/null || true
           done
           cp results.tsv merged/
-      - id: recheck
-        name: decide which failures are worth a recheck through the proxies
-        env:
-          RECHECK_MAX: ${{ vars.RECHECK_MAX_EXTENSIONS }}
-        run: |
-          python3 proto/publisher/needs_recheck.py results.tsv recheck-list.txt "${RECHECK_MAX:-$RECHECK_MAX_DEFAULT}"
-          if [ -s recheck-list.txt ]; then echo "has_recheck=1" >> "$GITHUB_OUTPUT"; else echo "has_recheck=0" >> "$GITHUB_OUTPUT"; fi
+      # The same pick each sweep shard made for its own recheck, over the whole run: the ids the
+      # recheck results are allowed to report on (merge_recheck.py in build-site).
+      - name: list the failures the shards rechecked
+        run: python3 proto/publisher/needs_recheck.py results.tsv recheck-list.txt 100000
       - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: merged-results
@@ -317,92 +350,11 @@ jobs:
           name: recheck-list
           path: recheck-list.txt
 
-  recheck:
-    # The flagged failures again, from other networks: GitHub-hosted runners that join the tailnet
-    # for the length of the job (OIDC, no stored secret) and send their traffic through the
-    # recheck proxies there, each source to a proxy in the country it wants first. Skipped until
-    # the TS_CLIENT_ID/TS_AUDIENCE variables exist. Only category-only results leave this job.
-    needs: [build, build-runtime, classify]
-    if: always() && needs.classify.result == 'success' && needs.classify.outputs.has_recheck == '1' && vars.TS_CLIENT_ID != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 330
-    permissions:
-      contents: read
-      id-token: write   # only to sign in to Tailscale as tag:kmon-ci
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          path: proto
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: ${{ env.EXTENSIONS_SOURCE_REPO }}
-          ref: ${{ needs.build.outputs.kei_commit }}
-          fetch-depth: 1
-          path: extensions-source
-          persist-credentials: false
-      - uses: actions/setup-java@8df1039502a15bceb9433410b1a100fbe190c53b # v4.5.0
-        with:
-          distribution: temurin
-          java-version: |
-            ${{ env.ANDROID_JAVA_VERSION }}
-            ${{ env.RUNTIME_JAVA_VERSION }}
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: runtime-dist
-          path: dist
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: extensions-build
-          path: .
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: recheck-list
-          path: .
-      - name: extract prebuilt extensions, pick this shard
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          sudo apt-get install -y -qq zstd >/dev/null || true
-          proto/harness/ci/extract-build.sh build.tar.zst extensions-source
-          python3 proto/harness/ci/split.py recheck-list.txt "$RECHECK_SHARDS" recheck-shards
-          cp "recheck-shards/shard-${SHARD}.txt" recheck-shard.txt
-          echo "$(wc -l < recheck-shard.txt) extension(s) in this shard"
-      - uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
-        with:
-          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
-          audience: ${{ vars.TS_AUDIENCE }}
-          tags: tag:kmon-ci
-          hostname: kmon-ci-${{ github.run_id }}-${{ matrix.shard }}
-      - name: recheck through the proxies
-        env:
-          EXT_RUN_JAVA_BIN: ${{ env.JAVA_HOME_21_X64 }}/bin/java
-          EXT_RUN_PREBUILT: "1"
-          RECHECK_PROXY_ORDER: ${{ vars.RECHECK_PROXY_ORDER }}
-          RUN_ID: ${{ github.run_id }}
-          SHARD: ${{ matrix.shard }}
-        run: |
-          chmod +x proto/harness/ci/*.sh
-          mkdir -p recheck-out
-          python3 proto/harness/ci/recheck.py extensions-source dist recheck-shard.txt "$RUN_ID" \
-            recheck-work "recheck-out/recheck-${SHARD}.json"
-      # Only the category-only payload: the raw logs/JSON can carry a proxy's exit IP (a block
-      # page that echoes it) and this repo's artifacts are public.
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        if: always()
-        with:
-          name: recheck-result-${{ matrix.shard }}
-          path: recheck-out/
-
   # NO job that holds `contents: write` ever extracts or runs anything an earlier job produced.
   # `build-site` does all of that (build_status.py, merge_recheck.py) with read-only permissions
   # and uploads the finished site; `deploy` below only downloads it and pushes it.
   build-site:
-    needs: [selftest, validate-inputs, build, classify, recheck]
+    needs: [selftest, validate-inputs, build, classify]
     runs-on: ubuntu-latest
     if: always() && needs.selftest.result == 'success' && needs.build.result == 'success' && needs.classify.result == 'success'
     permissions:
@@ -427,7 +379,7 @@ jobs:
         with:
           name: recheck-list
           path: .
-      # Absent when the recheck was skipped or every shard failed; the site still builds.
+      # Absent when no shard rechecked anything; the site still builds.
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         continue-on-error: true
         with:

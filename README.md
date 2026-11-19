@@ -32,15 +32,14 @@ be ahead of what the app ships. If something shows as failing here, check it in 
 |---|---|---|
 | `build-runtime` | GitHub-hosted | Builds the harness runtime (the app stand-in). Never touches extension code; its own Gradle cache key. |
 | `build` | GitHub-hosted | Checks out `extensions-source` at main (or a pinned, ancestry-verified SHA) and builds every extension's classpath **once**, with its own (read-only, kei-commit-keyed) Gradle cache. |
-| `sweep` | GitHub-hosted, sharded | Each shard runs the smoke check for its slice — no Gradle, just the already-built classes. One retry after a delay on failure. |
-| `classify` | GitHub-hosted | Merges the shards and decides which failures look IP/network-shaped (Cloudflare/403/429/timeout/connect patterns) rather than extension-shaped — the recheck list. |
-| `recheck` | GitHub-hosted, sharded, joins the tailnet (OIDC) | Runs the recheck list again through the recheck proxies, each source in the country it wants first ([`proxy/README.md`](proxy/README.md)). Emits only a category per extension. Skipped while the tailnet isn't configured. |
+| `sweep` | GitHub-hosted, sharded | Each shard runs the smoke check for its slice — no Gradle, just the already-built classes. One retry after a delay on failure. Then the shard's failures that look like a block go straight back out through the recheck proxies on the tailnet (OIDC sign-in), each source in the country it wants first ([`proxy/README.md`](proxy/README.md)); only a category per extension comes out of that. Skipped while the tailnet isn't configured. |
+| `classify` | GitHub-hosted | Merges the shards and decides which failures look IP/network-shaped (Cloudflare/403/429/timeout/connect patterns) rather than extension-shaped: the ids the recheck results may report on. |
 | `build-site` | GitHub-hosted, read-only (`contents: read`) | Builds `status.json` + the site, merges the recheck reports in, uploads the site as an artifact; never has write access to this repo. |
 | `deploy` | GitHub-hosted, `contents: write` | Only downloads `build-site`'s finished artifact and pushes it to `gh-pages`; it never extracts or executes anything from it. This split is what keeps the one job with push access from ever running a repo script against build output. |
 
 No workflow in this repo has a `pull_request` or `pull_request_target` trigger, and **none of
-them is, registers, or waits on a self-hosted GitHub Actions runner.** The recheck runs on
-GitHub-hosted runners too; they join a private Tailscale network for the length of the job and
+them is, registers, or waits on a self-hosted GitHub Actions runner.** The recheck runs in the
+sweep shards themselves; they join a private Tailscale network for the length of the job and
 send their traffic through the recheck proxies on it. See [`proxy/README.md`](proxy/README.md).
 
 ## Security model
@@ -68,7 +67,7 @@ the proxy's country. See [`proxy/README.md`](proxy/README.md) for the rest.
    Pages enabled at all (the `deploy` job that actually pushes to `gh-pages` only runs on a
    schedule run or an explicit `publish: true` dispatch input).
 4. *(Optional)* Set up the tailnet and at least one recheck proxy — see
-   [`proxy/README.md`](proxy/README.md). Without them the `recheck` job is skipped and the
+   [`proxy/README.md`](proxy/README.md). Without them the recheck is skipped and the
    pipeline reports a few more "can't test" extensions.
 
 ## Repo layout

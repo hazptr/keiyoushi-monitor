@@ -8,7 +8,7 @@ The BLOCKISH pattern: a failure that could be about the caller's IP (Cloudflare,
 connect/TLS/timeouts) is worth retrying from a different network; anything else will fail the
 same way everywhere, so there's no point rechecking it.
 
-Every id this script writes out becomes a path component in the recheck job, so it's
+Every id this script writes out becomes a path component in the recheck, so it's
 validated against node_schema.py's EXT_ID_RE — a malformed
 or path-traversal-shaped id from a corrupted/edited results.tsv is dropped here rather than
 carried forward.

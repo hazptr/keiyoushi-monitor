@@ -1,15 +1,15 @@
 # Recheck proxies
 
 Some sources fail the daily sweep only because of where it runs from: GitHub's datacenter IPs,
-or the wrong country. The `recheck` job in `status.yml` checks those flagged sources again from
-GitHub-hosted runners that join a private Tailscale network for the length of the job and send
-their traffic through the proxies on it. A pass there replaces the sweep's result on the page.
+or the wrong country. Each sweep shard in `status.yml` checks its own failures that look like a
+block again, right after its run: the runner joins a private Tailscale network and sends that
+traffic through the proxies on it. A pass there replaces the sweep's result on the page.
 
 Nothing runs on a proxy host except Tailscale and Squid. No runner, no extension code, no GitHub
-credentials. The host only forwards web requests for the recheck jobs.
+credentials. The host only forwards web requests for the sweep's rechecks.
 
 ```
-status.yml  classify ──> recheck (8 GitHub-hosted jobs, tag:kmon-ci, OIDC sign-in)
+status.yml  sweep shard: run ──> its blocked-looking failures again (tag:kmon-ci, OIDC sign-in)
                               │  tailnet: tag:kmon-ci may reach tag:kmon-proxy:3128, nothing else
                               ▼
             proxy host   tailscale (userspace) + squid on 127.0.0.1:3128 ──> the sites
@@ -17,7 +17,7 @@ status.yml  classify ──> recheck (8 GitHub-hosted jobs, tag:kmon-ci, OIDC si
 
 ## How a source picks a proxy
 
-`harness/ci/recheck.py`, in each recheck job:
+`harness/ci/recheck.py`, in each sweep shard:
 
 1. finds every online tailnet peer tagged `tag:kmon-proxy`;
 2. measures each one's exit country and time zone *through the proxy* (ip-api.com, only the
@@ -57,13 +57,13 @@ exit IP (a block page that echoes it) and this repo's artifacts are public.
    credential for GitHub Actions, issuer `https://token.actions.githubusercontent.com`, subject
    `repo:<owner>/<repo>:*`, scope `auth_keys` (write) with tag `tag:kmon-ci`. Put its client ID
    and audience in the repo **variables** (not secrets; neither is sensitive) `TS_CLIENT_ID` and
-   `TS_AUDIENCE`. No stored secret: each job signs in with its own short-lived GitHub OIDC token
-   and gets an ephemeral node that disappears when the job ends. The `recheck` job is skipped
-   while `TS_CLIENT_ID` is unset.
+   `TS_AUDIENCE`. No stored secret: each shard signs in with its own short-lived GitHub OIDC token
+   and gets an ephemeral node that disappears when the job ends. The recheck is skipped while
+   `TS_CLIENT_ID` is unset.
 4. Settings → Keys: generate a **reusable, pre-approved, tagged** (`tag:kmon-proxy`) auth key for
    each proxy host. That's the only thing a proxy owner needs from you.
 
-What a leak costs: extension code runs in the recheck job and can see what the job can (its
+What a leak costs: extension code runs in the sweep job and can see what the job can (its
 Tailscale node, its OIDC token). With the policy above that gets it to port 3128 on the proxies,
 which forward only ports 80/443 to public addresses, at the Squid bandwidth cap, until the job
 ends.
@@ -94,6 +94,6 @@ KMON_UPSTREAM_NETWORK=<network the VPN's HTTP proxy is on> KMON_SQUID_LOCAL=/pat
   docker compose -p kmon-pia -f proxy/compose.yml -f proxy/compose.upstream.yml up -d
 ```
 
-What a proxy owner should know: the recheck jobs visit manga sites, their images and whatever
-ad/analytics networks they load, from the proxy's IP, at most once a day for a few hours and
-capped at ~4 MB/s (`delay_parameters` in `squid.conf`). Squid keeps no access log.
+What a proxy owner should know: the rechecks visit manga sites, their images and whatever
+ad/analytics networks they load, from the proxy's IP, once a day while the sweep runs, from up
+to one runner per shard at a time, capped at ~4 MB/s (`delay_parameters` in `squid.conf`). Squid keeps no access log.

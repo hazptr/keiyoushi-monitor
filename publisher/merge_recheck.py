@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build-site: fold the recheck jobs' results into the status.json build_status.py just wrote.
+"""build-site: fold the sweep shards' recheck results into the status.json build_status.py just wrote.
 
     merge_recheck.py <status.json> <recheck-list.txt> <results-dir>
 

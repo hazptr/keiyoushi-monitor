@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#101012" media="(prefers-color-scheme: dark)">
+<meta name="description" content="Daily status of every keiyoushi 1.6 extension">
+<title>keiyoushi extension status</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css?v=311c238e2b">
+</head>
+<body>
+<main>
+<aside class="side">
+  <header>
+    <h1><img class="logo" src="favicon.svg" alt="" width="26" height="26">keiyoushi extension status</h1>
+    <p class="muted small" id="meta">Loading…</p>
+  </header>
+
+  <section class="summary" aria-label="Summary">
+    <div class="sbar" id="sbar" aria-hidden="true"></div>
+    <div class="legend" id="legend" role="group" aria-label="Filter by status"></div>
+    <div class="progress small muted" id="progress" hidden>
+      <span id="progress-text"></span>
+      <span class="ptrack"><span class="pfill" id="pfill"></span></span>
+    </div>
+    <p class="note small">Results can be wrong: sites change, block automated checks or go down for a bit. Check in the
+      app before opening an issue.</p>
+  </section>
+
+
+  <div class="bar">
+    <div class="search">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6"/><path d="m14 14 4 4"/></svg>
+      <input id="q" type="search" placeholder="Search extensions" aria-label="Search extensions" autocomplete="off" spellcheck="false">
+      <kbd>/</kbd>
+    </div>
+    <select id="lang" aria-label="Language"><option value="">All languages</option></select>
+    <select id="tag" aria-label="Why it was turned away" hidden><option value="">Any reason</option></select>
+    <select id="content" aria-label="Content">
+      <option value="">SFW only</option>
+      <option value="all">All content</option>
+      <option value="nsfw">NSFW only</option>
+    </select>
+    <select id="sort" aria-label="Sort">
+      <option value="">By status</option>
+      <option value="name">By name</option>
+      <option value="recent">Recently changed</option>
+    </select>
+  </div>
+
+  <footer class="about small">
+    <p>Not affiliated with keiyoushi. Some checks (page 2 of lists, placeholder images) come from
+      <a href="https://github.com/vetleledaal/keiyoushi-status">vetleledaal’s keiyoushi-status</a>.</p>
+    <p>© 2026 keiyoushi-monitor contributors ·
+      <a href="https://github.com/hazptr/keiyoushi-monitor/blob/main/LICENSE">Apache License 2.0</a> ·
+      <a href="https://github.com/hazptr/keiyoushi-monitor">Source</a></p>
+  </footer>
+</aside>
+
+<div class="content">
+  <section class="changes" id="changes" hidden>
+    <h2 class="small" id="changes-title">Changed since the last run</h2>
+    <ul class="clist" id="clist"></ul>
+    <button type="button" class="linkish small" id="cmore" hidden></button>
+  </section>
+
+  <p class="muted small" id="count" aria-live="polite"></p>
+  <p class="hidden-hint small" id="hidden-hint" hidden></p>
+  <div id="groups"></div>
+  <p class="empty muted" id="empty" hidden></p>
+
+</div>
+</main>
+<script src="app.js?v=4bb1c705bb"></script>
+</body>
+</html>

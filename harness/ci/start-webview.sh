@@ -29,13 +29,6 @@ rm -f "$SOCK"
 export DISPLAY=:99
 export CHROME_BIN
 export EXT_RUN_WV_NO_GPU=1   # no real GPU on the runner; see bridge.py
-# GitHub-hosted runners run as root inside a container image where Chrome's own sandbox setup is
-# blocked; this is the one place --no-sandbox is still unavoidable (see bridge.py's comment). The
-# recheck node image runs rootless and leaves Chrome's sandbox on. this used to
-# hardcode =0 unconditionally, which would also force the node's run to --no-sandbox if this
-# script were ever reused there — respect an explicit override (e.g. a caller that already knows
-# its container can run Chrome sandboxed) and only default to 0 for this GitHub-hosted path.
-export EXT_RUN_WV_CHROME_SANDBOX=${EXT_RUN_WV_CHROME_SANDBOX:-0}
 export TZ=${EXT_RUN_TZ:-UTC}   # configurable; defaults to UTC rather than any specific locale/region
 nohup python3 -u "$HERE/../webview/nodriver/bridge.py" "$SOCK" >"$SOCK.log" 2>&1 &
 echo $! >"$SOCK.pid"

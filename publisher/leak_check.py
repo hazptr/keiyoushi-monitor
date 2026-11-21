@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""Shared scrubbing/leak-check primitives used by the `publish` job (scrub whatever lands in
-status.json) and as a backstop for anything a recheck reports (see publisher/categorize.py,
-which turns a raw smoke result into a category-only row before it ever leaves the sandbox — this
-module exists for the GitHub-hosted side's free text and as a last line of defense, not as the
-thing that makes node output safe)."""
+"""Shared scrubbing/leak-check primitives: build_status.py scrubs whatever lands in status.json
+and refuses to write a site that still holds a leak."""
 import re
 import subprocess
 import sys
@@ -32,7 +29,7 @@ IPV4_DEC = re.compile(r"\b(?:ip|addr|address)[=:]\s*\d{8,10}\b", re.I)
 # a connection even though they aren't themselves IPv4-shaped.
 DASHED_IP_HOST = re.compile(r"\b[a-z]*-?\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}\.[\w-]+(?:\.[\w-]+)+\b", re.I)
 # ISO-8601 UTC-offset suffixes on a timestamp ("...12:03:00+09:00" / "...12:03:00+0900") can hint
-# at a node's timezone/region; scrub the offset itself, leaving the timestamp.
+# at the runner's or a proxy's timezone/region; scrub the offset itself, leaving the timestamp.
 ISO_TZ_OFFSET = re.compile(r"(T\d{2}:\d{2}:\d{2}(?:\.\d+)?)[+-]\d{2}:?\d{2}\b")
 
 
@@ -122,10 +119,9 @@ def leak_check(root, extra_needles: list | None = None) -> list:
     own absolute checkout path). Returns a list of human-readable hit descriptions; empty means
     clean. The caller decides what "clean" means for it (dry-run vs fail-closed).
 
-    Skips anything that isn't valid UTF-8 text — a published opaque binary artifact (the recheck
-    bundle: compiled extension bytecode, same content upstream already publishes) is full of
-    byte sequences that incidentally match an IP/ray-shaped regex without being one; this check
-    exists for text we or a node produced, not for text-scanning arbitrary binary blobs."""
+    Skips anything that isn't valid UTF-8 text — an opaque binary (an image, compiled bytecode) is
+    full of byte sequences that incidentally match an IP/ray-shaped regex without being one; this check
+    exists for text we produced, not for text-scanning arbitrary binary blobs."""
     hits = []
     needles = [n for n in (extra_needles or []) if n]
     for f in root.rglob("*"):

@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
-"""Recheck a sweep shard's blocked-looking failures through the recheck proxies.
+"""Run a sweep shard's blocked-looking failures again through the recheck proxies.
 
-    recheck.py <extensions-source> <runtime-dist> <shard-file> <run-id> <work-dir> <out.json>
+    recheck.py <extensions-source> <runtime-dist> <shard-out-dir> <work-dir>
+    recheck.py --any <shard-out-dir>     exit 0 if the shard has anything to recheck, else 1
 
-Runs in the sweep shard right after its own run, on the same GitHub-hosted runner, once that
-runner has joined the tailnet as tag:kmon-ci (the tailscale/github-action step before this).
-The proxies are every online tailnet peer tagged tag:kmon-proxy, plus any public proxies in the
-RECHECK_PROXIES secret: a JSON list of {"name": ..., "url": "http://[user:pass@]host:port"} (or
-socks5://), with "geoOnly": true for a proxy that should only see sources wanting its country
-(someone's own server, where the whole flagged list would get its IP blocked). A SOCKS5 proxy, or an HTTP one with a login, goes through proxy_chain.py on 127.0.0.1,
-since Chrome and the JVM can't send proxy credentials (and the JVM only speaks HTTP proxy). Each proxy's exit country and time zone are measured
-through the proxy itself at the start, so a proxy's location is never taken on trust.
+Runs in the sweep shard right after run-shard.sh, on the same runner. Reads the shard's
+results.tsv, sends every failure that looks like a block (BLOCKISH) out through the proxies, and
+writes <shard-out-dir>/recheck.json: per extension the status the page would give the proxy run
+(publisher/build_status.py's own entry()), its failing step, block tags, notes and the proxy's
+country. Nothing else from the proxy run leaves <work-dir>: its raw logs can carry a proxy's exit
+IP, and the shard's artifact is public.
 
-Each extension goes to the proxies in this order: those in a country it prefers (recheck/geo.tsv,
-else a default for languages tied to one country, e.g. vi -> VN), then any named in
-RECHECK_PROXY_ORDER (comma-separated), then the rest spread evenly: a stable per-extension shuffle,
-alternating plain VPN exits and WARP exits (a name containing "warp"), so the shards don't all
-pile onto one proxy and a second try leaves from a different kind of network. It moves on to the
-next proxy only while the result still looks like a block (blocked, cloudflare, timeout,
-connect), at most RECHECK_MAX_TRIES (default 3) proxies; a real failure is the same from
-anywhere. A pass anywhere is a pass.
-
-Output is the category-only payload publisher/categorize.py defines (no raw text, safe for a public
-artifact), each pass carrying the country it passed from as `cc`. The console only ever shows
-proxy names, countries and per-extension status words: never an exit IP or a proxy URL, never
-error text.
+Proxies: every online tailnet peer tagged tag:kmon-proxy (the runner joined the tailnet in the step
+before), plus the RECHECK_PROXIES secret (proxy/README.md). Each one's exit country and time zone
+are measured through the proxy itself. An extension goes first to proxies in a country it wants
+(recheck/geo.tsv, else LANG_COUNTRY), then those named in RECHECK_PROXY_ORDER, then the rest in a
+stable per-extension shuffle that alternates plain and WARP exits. It moves to the next proxy only
+while the result still looks like a block, at most RECHECK_MAX_TRIES (default 3) proxies.
+The console shows proxy names, countries and status words only.
 """
 import hashlib
 import json
@@ -40,11 +33,18 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT / "publisher"))
-from node_schema import validate_node_payload  # noqa: E402
+from build_status import entry  # noqa: E402
 
 PROXY_TAG = "tag:kmon-proxy"
 PROXY_PORT = 3128
-RETRY_CATEGORIES = {"blocked", "cloudflare", "timeout", "connect"}
+MAX_PER_SHARD = 300
+# A failure that could be about where the check runs from; anything else fails the same everywhere.
+BLOCKISH = re.compile(
+    r"HTTP error (403|429|451|5\d\d)\b|cloudflare|challenge|bypass|turnstile|cf-mitigated|"
+    r"timed? ?out|timeout|connect(ion)?(exception| refused| reset)|failed to connect|"
+    r"unknownhost|could not resolve|ssl|handshake|unexpected end of stream|\beof\b",
+    re.I,
+)
 # Languages spoken in essentially one country, where a site's audience (and any geo rule) is there.
 LANG_COUNTRY = {"vi": "VN", "id": "ID", "th": "TH", "ko": "KR", "ja": "JP", "tr": "TR",
                 "pl": "PL", "uk": "UA", "cs": "CZ", "it": "IT", "de": "DE", "ru": "RU"}
@@ -55,22 +55,37 @@ def log(msg: str) -> None:
     print(f"[recheck] {msg}", flush=True)
 
 
-def discover() -> list[dict]:
+def read_tsv(path: Path) -> dict[str, tuple[str, str]]:
+    """ext -> (status, summary)."""
+    rows = {}
+    if path.exists():
+        for line in path.read_text().splitlines()[1:]:
+            cols = line.split("\t") + ["", "", ""]
+            if cols[0]:
+                rows[cols[0]] = (cols[1], cols[3])
+    return rows
+
+
+def candidates(out: Path) -> list[str]:
+    rows = read_tsv(out / "results.tsv")
+    return [e for e, (st, summary) in rows.items() if st in ("fail", "error") and BLOCKISH.search(summary)][:MAX_PER_SHARD]
+
+
+# ---- proxies
+
+def tailnet_proxies() -> list[dict]:
     try:
         out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
     except FileNotFoundError:
-        return []  # not on the tailnet this run (only public proxies)
+        return []  # not on the tailnet this run
     if out.returncode != 0:
         log("tailscale status failed; no tailnet proxies")
         return []
-    peers = (json.loads(out.stdout).get("Peer") or {}).values()
     found = []
-    for p in peers:
-        if PROXY_TAG not in (p.get("Tags") or []) or not p.get("Online"):
-            continue
+    for p in (json.loads(out.stdout).get("Peer") or {}).values():
         v4 = [ip for ip in p.get("TailscaleIPs") or [] if "." in ip]
-        if v4:
-            found.append({"name": p.get("HostName") or p.get("DNSName", "?"), "host": v4[0], "port": PROXY_PORT})
+        if PROXY_TAG in (p.get("Tags") or []) and p.get("Online") and v4:
+            found.append({"name": p.get("HostName") or "?", "host": v4[0], "port": PROXY_PORT})
     return found
 
 
@@ -81,23 +96,22 @@ def free_port() -> int:
 
 
 def public_proxies() -> list[dict]:
-    """RECHECK_PROXIES, masked in the job log before anything else touches it. A proxy with a
-    login gets its own proxy_chain.py front; one without is used as is."""
+    """RECHECK_PROXIES, masked in the job log first. A SOCKS5 proxy or one with a login gets a
+    proxy_chain.py front on 127.0.0.1 (Chrome and the JVM can't send proxy credentials)."""
     raw = os.environ.get("RECHECK_PROXIES", "").strip()
-    if not raw:
-        return []
     try:
-        entries = json.loads(raw)
+        entries = json.loads(raw) if raw else []
     except json.JSONDecodeError:
         print("::warning::RECHECK_PROXIES isn't valid JSON; ignoring it")
         return []
     found = []
     for i, e in enumerate(entries if isinstance(entries, list) else []):
-        url = e.get("url", "") if isinstance(e, dict) else str(e)
+        e = e if isinstance(e, dict) else {"url": str(e)}
+        url = e.get("url", "")
         u = urllib.parse.urlsplit(url)
         for secret in {url, u.hostname or "", u.password or "", u.username or ""} - {""}:
             print(f"::add-mask::{secret}")
-        name = re.sub(r"[^a-z0-9-]", "-", str(e.get("name") if isinstance(e, dict) and e.get("name") else f"public-{i + 1}").lower())
+        name = re.sub(r"[^a-z0-9-]", "-", str(e.get("name") or f"public-{i + 1}").lower())
         if u.scheme not in ("http", "socks5", "socks5h") or not u.hostname:
             log(f"{name}: only http:// and socks5:// proxies are supported; skipping")
             continue
@@ -110,13 +124,13 @@ def public_proxies() -> list[dict]:
             found.append({"name": name, "host": "127.0.0.1", "port": port})
         else:
             found.append({"name": name, "host": u.hostname, "port": u.port or 8080})
-        found[-1]["geoOnly"] = bool(isinstance(e, dict) and e.get("geoOnly"))
+        found[-1]["geoOnly"] = bool(e.get("geoOnly"))
     return found
 
 
 def probe(proxy: dict) -> dict | None:
-    """The proxy's exit country + time zone, as the outside world sees it. Only those two fields
-    are requested, so the exit IP never even reaches this process."""
+    """The proxy's exit country + time zone as the outside sees it; only those fields are asked
+    for, so the exit IP never reaches this process."""
     url = "http://ip-api.com/json/?fields=status,countryCode,timezone"
     for attempt in range(4):
         r = subprocess.run(["curl", "-sS", "--max-time", "20", "-x", f"http://{proxy['host']}:{proxy['port']}", url],
@@ -136,16 +150,15 @@ def load_geo() -> dict[str, list[str]]:
     geo = {}
     if GEO_FILE.exists():
         for line in GEO_FILE.read_text().splitlines():
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            ext, _, ccs = line.partition("\t")
-            geo[ext.strip()] = [c.strip().upper() for c in ccs.replace(" ", ",").split(",") if c.strip()]
+            ext, _, ccs = line.split("#", 1)[0].strip().partition("\t")
+            if ext:
+                geo[ext.strip()] = [c.strip().upper() for c in ccs.replace(" ", ",").split(",") if c.strip()]
     return geo
 
 
 def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str]) -> list[dict]:
-    wanted = geo.get(ext) or ([LANG_COUNTRY[ext.split("/")[0]]] if ext.split("/")[0] in LANG_COUNTRY else [])
+    lang = ext.split("/")[0]
+    wanted = geo.get(ext) or ([LANG_COUNTRY[lang]] if lang in LANG_COUNTRY else [])
 
     def shuffle(p):
         return hashlib.sha256(f"{ext}|{p['name']}".encode()).hexdigest()
@@ -158,98 +171,94 @@ def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str]) ->
     rest = [p for p in proxies if p not in head]
     plain = sorted((p for p in rest if "warp" not in p["name"]), key=shuffle)
     warp = sorted((p for p in rest if "warp" in p["name"]), key=shuffle)
-    mixed = [p for pair in zip(plain, warp) for p in pair] + plain[len(warp):] + warp[len(plain):]
-    return head + mixed
+    return head + [p for pair in zip(plain, warp) for p in pair] + plain[len(warp):] + warp[len(plain):]
 
+
+# ---- runs
 
 def stop_webview() -> None:
-    """Every run-shard.sh call starts its own WebView sidecar (Xvfb :99 + bridge.py + Chrome) and
-    leaves it running; the next call needs :99 free and a Chrome on the new proxy. Also clears
-    the sweep's own sidecar before the first group."""
+    """run-shard.sh starts its own sidecar (Xvfb :99 + bridge.py + Chrome) and leaves it running;
+    the next group needs :99 free and a Chrome on its own proxy."""
     for pattern in ("--remote-debugging", "webview/nodriver/bridge.py", "Xvfb :99"):
         subprocess.run(["pkill", "-f", "--", pattern], capture_output=True)
     time.sleep(2)
 
 
-def run_group(proxy: dict, exts: list[str], wt: str, dist: str, out: Path, run_id: str, run_date: str) -> list[dict]:
+def run_group(proxy: dict, exts: list[str], wt: str, dist: str, out: Path) -> dict[str, tuple[str, str]]:
     out.mkdir(parents=True, exist_ok=True)
-    shard = out / "shard.txt"
-    shard.write_text("\n".join(exts) + "\n")
-    url = f"http://{proxy['host']}:{proxy['port']}"
-    env = {**os.environ,
-           "EXT_RUN_QUIET": "1",
-           "EXT_RUN_VIA": "proxy",
-           "EXT_RUN_WV_PROXY": url,
+    (out / "shard.txt").write_text("\n".join(exts) + "\n")
+    h, p = proxy["host"], proxy["port"]
+    env = {**os.environ, "EXT_RUN_QUIET": "1", "EXT_RUN_VIA": "proxy", "EXT_RUN_WV_PROXY": f"http://{h}:{p}",
            "EXT_RUN_TZ": proxy["tz"],
-           "EXT_RUN_JAVA_EXTRA_OPTS": (f"{os.environ.get('EXT_RUN_JAVA_EXTRA_OPTS', '')} "
-                                       f"-Dhttps.proxyHost={proxy['host']} -Dhttps.proxyPort={proxy['port']} "
-                                       f"-Dhttp.proxyHost={proxy['host']} -Dhttp.proxyPort={proxy['port']} ").strip()}
+           "EXT_RUN_JAVA_EXTRA_OPTS": f"{os.environ.get('EXT_RUN_JAVA_EXTRA_OPTS', '')} -Dhttps.proxyHost={h} "
+                                      f"-Dhttps.proxyPort={p} -Dhttp.proxyHost={h} -Dhttp.proxyPort={p}".strip()}
     log(f"{len(exts)} extension(s) via {proxy['name']} ({proxy['cc']})")
     stop_webview()
-    subprocess.run([str(HERE / "run-shard.sh"), wt, dist, str(shard), str(out)], env=env)
+    subprocess.run([str(HERE / "run-shard.sh"), wt, dist, str(out / "shard.txt"), str(out)], env=env)
     stop_webview()
-    res = out / "result.json"
-    r = subprocess.run([sys.executable, str(ROOT / "publisher" / "categorize.py"), str(out / "results.tsv"),
-                        str(out / "json"), run_id, run_date, str(res)], capture_output=True, text=True)
-    if r.returncode != 0 or not res.exists():
-        log(f"couldn't categorize the results from {proxy['name']}; counting them as errors")
-        return [{"id": e, "category": "error"} for e in exts]
-    return json.loads(res.read_text())["results"]
+    return read_tsv(out / "results.tsv")
+
+
+def verdict(wt: str, run_dir: Path, ext: str, status: str, summary: str, cc: str) -> dict | None:
+    """What the page takes from a proxy run: the fixed fields of build_status.entry() on it.
+    None when the run says nothing about the site (a harness error, or still a timeout/connect
+    failure on a proxy, which is the proxy's network rather than the extension)."""
+    x = entry(Path(wt), run_dir / "json", ROOT / "config", ext, status, summary, "proxy")
+    st = x["status"]
+    if st not in ("pass", "partial", "fail", "maybe") or (st in ("partial", "fail") and BLOCKISH.search(summary)):
+        return None
+    if st in ("partial", "fail") and not x.get("step"):
+        x["step"] = next((o["op"] for o in x.get("ops", []) if o["status"] == "fail"), None)
+        if not x["step"]:
+            return None
+    row = {"status": st, "cc": cc}
+    for k in ("step", "tags", "notes"):
+        if x.get(k):
+            row[k] = x[k]
+    return row
 
 
 def main():
-    if len(sys.argv) != 7:
+    if sys.argv[1:2] == ["--any"]:
+        sys.exit(0 if candidates(Path(sys.argv[2])) else 1)
+    if len(sys.argv) != 5:
         sys.exit(__doc__)
-    wt, dist, shard_file, run_id, work, out_path = sys.argv[1:7]
-    run_date = time.strftime("%Y-%m-%d", time.gmtime())
-    exts = [l.strip() for l in Path(shard_file).read_text().splitlines() if l.strip()]
-    payload = {"runId": run_id, "runDate": run_date, "results": []}
-    if not exts:
-        Path(out_path).write_text(json.dumps(payload))
-        log("nothing to recheck in this shard")
-        return
-
-    candidates = discover() + public_proxies()
-    names = [p["name"] for p in candidates]
-    candidates = [p for i, p in enumerate(candidates) if p["name"] not in names[:i]]  # first of a name wins
-    proxies = [p for p in (probe(p) for p in candidates) if p]
+    wt, dist, out, work = sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+    exts = candidates(out)
+    result: dict[str, dict] = {}
+    proxies = [p for p in (probe(p) for p in tailnet_proxies() + public_proxies()) if p]
+    proxies = [p for i, p in enumerate(proxies) if p["name"] not in [q["name"] for q in proxies[:i]]]
     for p in proxies:
         log(f"proxy {p['name']}: exits in {p['cc']}")
-    if not proxies:
-        Path(out_path).write_text(json.dumps(payload))
+    if exts and not proxies:
         print("::warning::no recheck proxy reachable; nothing rechecked")
-        return
-
-    geo = load_geo()
-    ranking = [n.strip() for n in os.environ.get("RECHECK_PROXY_ORDER", "").split(",") if n.strip()]
-    orders = {e: proxy_order(e, proxies, geo, ranking) for e in exts}
-    final: dict[str, dict] = {}
-    pending = list(exts)
-    tries = min(len(proxies), max(1, int(os.environ.get("RECHECK_MAX_TRIES") or 3)))
-    for rnd in range(tries):
-        if not pending:
-            break
-        groups: dict[str, list[str]] = {}
-        for e in pending:
-            groups.setdefault(orders[e][rnd]["name"], []).append(e)
-        still = []
-        for name, group in groups.items():
-            proxy = next(p for p in proxies if p["name"] == name)
-            rows = run_group(proxy, group, wt, dist, Path(work) / f"r{rnd}-{name}", run_id, run_date)
-            got = {r["id"]: r for r in rows}
-            for e in group:
-                row = got.get(e, {"id": e, "category": "error"})
-                if row["category"] == "pass":
-                    row = {**row, "cc": proxy["cc"]}
-                final[e] = row
-                if row["category"] in RETRY_CATEGORIES and rnd + 1 < tries:
-                    still.append(e)
-        pending = still
-
-    payload["results"] = [final[e] for e in exts if e in final]
-    validated = validate_node_payload(payload, set(exts), run_date=run_date)
-    Path(out_path).write_text(json.dumps(validated))
-    passed = sum(r["category"] == "pass" for r in validated["results"])
+    if exts and proxies:
+        geo = load_geo()
+        ranking = [n.strip() for n in os.environ.get("RECHECK_PROXY_ORDER", "").split(",") if n.strip()]
+        orders = {e: proxy_order(e, proxies, geo, ranking) for e in exts}
+        tries = max(1, int(os.environ.get("RECHECK_MAX_TRIES") or 3))
+        pending = [e for e in exts if orders[e]]
+        for rnd in range(tries):
+            groups: dict[str, list[str]] = {}
+            for e in pending:
+                if rnd < len(orders[e]):
+                    groups.setdefault(orders[e][rnd]["name"], []).append(e)
+            pending = []
+            for name, group in groups.items():
+                proxy = next(p for p in proxies if p["name"] == name)
+                run_dir = work / f"r{rnd}-{name}"
+                rows = run_group(proxy, group, wt, dist, run_dir)
+                for e in group:
+                    status, summary = rows.get(e, ("error", ""))
+                    v = verdict(wt, run_dir, e, status, summary, proxy["cc"])
+                    if v:
+                        result[e] = v
+                    if status != "pass" and BLOCKISH.search(summary):
+                        pending.append(e)
+            if not pending:
+                break
+    (out / "recheck.json").write_text(json.dumps(result, indent=1))
+    passed = sum(r["status"] == "pass" for r in result.values())
     log(f"done: {passed} of {len(exts)} pass through a proxy")
 
 

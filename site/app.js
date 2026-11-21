@@ -107,11 +107,9 @@
         return r ? { status: r[1], date: r[0] } : null;
     }
 
-    // A node result only ever carries a fixed category (publisher/node_schema.py) — never free text —
-    // so this is the one place that turns that into something a reader sees. `error` is already the
-    // plain sentence merge_node_result.py wrote (natural phrasing, same style as OPS below); the only
-    // thing worked out here is the one case a node pass never needs to store a string for.
-    const nodeText = (x) =>
+    // A recheck through the proxies carries no text of its own: `error` is the fixed sentence
+    // build_status.py wrote for its verdict, and a pass gets this one.
+    const recheckText = (x) =>
         x.status === 'pass'
             ? `Works through our recheck proxy${x.recheckedFrom ? ` in ${x.recheckedFrom}` : ''}`
             : x.error || 'Also blocked through our recheck proxies';
@@ -225,8 +223,8 @@
 
     function report(x) {
         const lines = [`${x.name} (${version(x)}): ${LABEL(x.status)}`];
-        if (x.recheckedOnNode) {
-            lines.push(nodeText(x));
+        if (x.rechecked) {
+            lines.push(recheckText(x));
         } else {
             for (const o of x.ops || []) if (['fail', 'maybe'].includes(o.status)) lines.push(`${OPS[o.op]?.[0] || o.op}: ${o.error}`);
             if (!x.ops?.some((o) => ['fail', 'maybe'].includes(o.status)) && x.error) lines.push(x.error);
@@ -253,23 +251,12 @@
                 ),
             );
         }
-        if (x.recheckedOnNode) {
-            // A node's result is never a GitHub-side step failure — it's one fixed category, reported
-            // separately from (and not a substitute for) whatever GitHub's own servers saw. The GitHub
-            // ops below are real data from this run, just not what the node checked, so they're labelled
-            // rather than hidden.
-            parts.push(
-                el(
-                    'p',
-                    { class: 'panel muted' },
-                    el('b', {}, 'Rechecked through a proxy: '),
-                    nodeText(x),
-                    x.recheckedOn ? ` (${day(x.recheckedOn)})` : '',
-                ),
-            );
+        if (x.rechecked) {
+            // The ops below are what GitHub's servers saw in the same run, so they're labelled rather than hidden.
+            parts.push(el('p', { class: 'panel muted' }, el('b', {}, 'Rechecked through a proxy: '), recheckText(x)));
         }
         if (x.ops?.length) {
-            if (x.recheckedOnNode) parts.push(el('p', { class: 'muted small' }, 'From GitHub’s servers:'));
+            if (x.rechecked) parts.push(el('p', { class: 'muted small' }, 'From GitHub’s servers:'));
             parts.push(stepper(x));
             // Steps skipped because an earlier one failed only repeat that failure, so they're left out.
             const failed = x.ops.some((o) => ['fail', 'maybe'].includes(o.status));
@@ -298,7 +285,7 @@
                     ),
                 );
             }
-        } else if (x.error && !x.recheckedOnNode) {
+        } else if (x.error && !x.rechecked) {
             parts.push(el('p', { class: 'panel' }, x.error));
         }
         if (x.notes?.length) {
@@ -345,15 +332,14 @@
 
     function makeRow(x) {
         const nsfw = x.contentWarning === 'NSFW';
-        // A node-rechecked pass is still worth a line (so it doesn't look identical to a GitHub-side
-        // pass that was never flaky) — the rest of a plain pass stays silent, as before.
+        // A pass through a recheck proxy is still worth a line, so it doesn't look like one that never failed.
         const issue =
-            x.status === 'pass' && !x.recheckedOnNode
+            x.status === 'pass' && !x.rechecked
                 ? null
                 : el(
                       'span',
                       { class: `issue ${x.status}` },
-                      x.recheckedOnNode ? nodeText(x) : plain(x),
+                      x.rechecked ? recheckText(x) : plain(x),
                       ...(changedSince(x) ? [el('span', { class: 'since' }, ` · since ${shortDay(x.since)}`)] : []),
                   );
         const det = el(

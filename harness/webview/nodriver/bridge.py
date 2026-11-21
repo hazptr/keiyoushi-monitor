@@ -66,23 +66,7 @@ if os.environ.get("EXT_RUN_WV_NO_GPU") == "1":
 else:
     GPU_ARGS = ["--use-gl=angle", "--use-angle=vulkan", "--enable-features=Vulkan", "--ignore-gpu-blocklist"]
 
-# Chrome's own sandbox needs a setuid helper or the ability to create user namespaces, which a
-# hardened container usually blocks. EXT_RUN_WV_CHROME_SANDBOX=1 keeps it on; the launch scripts
-# default to 0 (--no-sandbox), and the recheck node's controller sets 1 only when chrome_sandbox
-# is enabled in its config and the container got the matching seccomp profile.
-_SANDBOX_ON = os.environ.get("EXT_RUN_WV_CHROME_SANDBOX", "1") == "1"
-CHROME_SANDBOX_ARGS = [] if _SANDBOX_ON else ["--no-sandbox"]
-
-# IsolateOrigins/site-per-process disabling weakens one of Chrome's own security
-# boundaries (process-per-site isolation) — fine to trade off on the GitHub-hosted runner, which
-# is already running Chrome with --no-sandbox and has no untrusted-host concerns beyond what the
-# container/VM itself provides, but there's no reason to also give it up on the recheck node,
-# where Chrome's sandbox is the whole point. Only disabled when the sandbox itself is off.
-_DISABLE_FEATURES = ["HttpsUpgrades"] if _SANDBOX_ON else ["HttpsUpgrades", "IsolateOrigins", "site-per-process"]
-
-# Outbound HTTP(S) proxy for the browser, e.g. the recheck node's egress proxy
-# (http://proxy:3128) — the sandbox has no direct route to the internet at all, only through
-# this proxy. Unset in CI, where the GitHub-hosted runner's own network is used directly.
+# The recheck proxy for the browser (harness/ci/recheck.py); unset for the sweep itself.
 PROXY_ARGS = [f"--proxy-server={os.environ['EXT_RUN_WV_PROXY']}"] if os.environ.get("EXT_RUN_WV_PROXY") else []
 
 # --remote-allow-origins is set per-launch (Browser.start(), with the actual --remote-debugging-
@@ -94,8 +78,7 @@ CHROME_ARGS = [
     "--no-first-run", "--no-service-autorun", "--no-default-browser-check",
     "--homepage=about:blank", "--no-pings", "--password-store=basic", "--disable-infobars", "--disable-breakpad",
     "--disable-dev-shm-usage", "--disable-session-crashed-bubble", "--disable-search-engine-choice-screen",
-    f"--disable-features={','.join(_DISABLE_FEATURES)}", "--lang=en-US",
-    *CHROME_SANDBOX_ARGS, *PROXY_ARGS,
+    "--disable-features=IsolateOrigins,site-per-process,HttpsUpgrades", "--no-sandbox", "--lang=en-US", *PROXY_ARGS,
     f"--window-size={WINDOW[0]},{WINDOW[1]}", *GPU_ARGS,
     "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--disable-background-timer-throttling",
 ]

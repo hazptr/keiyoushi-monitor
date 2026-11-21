@@ -30,8 +30,9 @@ status.yml  sweep shard: run ──> its blocked-looking failures again (tag:kmo
 4. moves a source on to the next proxy only while its result still looks like a block (blocked,
    cloudflare, timeout, connect). A pass anywhere counts, with the country it passed from.
 
-Only the category-only result (`publisher/node_schema.py`) leaves the job. Raw logs can carry an
-exit IP (a block page that echoes it) and this repo's artifacts are public.
+Only the verdict leaves the job (the shard's `recheck.json`: status, failing step, block tags,
+notes from a fixed list, the proxy's country). The proxy runs' logs stay on the runner: they can
+carry an exit IP (a block page that echoes it) and this repo's artifacts are public.
 
 ## Public proxies
 

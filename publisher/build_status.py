@@ -4,12 +4,11 @@ deploy. Has no local persistent state — history ("since", run-history strips, 
 is read back from the currently-published status.json instead of a state directory, so a fork
 needs nothing but this repo + its Pages branch.
 
-A later, separate workflow (`ingest`, triggered by a recheck node's controller — see
-node/README.md) can patch individual entries in the already-published status.json; this script
-has no part in that and no concept of a node recheck.
+The sweep shards' rechecks through the proxies (harness/ci/recheck.py) come in as --recheck, a
+JSON object ext -> {status, cc, step?, tags?, notes?}; a recheck's verdict replaces the sweep's.
 
   build_status.py --results TSV --extensions-source DIR --site DIR --out DIR
-                   [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
+                   [--recheck FILE] [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
                    [--kei-commit SHA] [--run-id ID] [--progress DONE/TOTAL] [--run-date YYYY-MM-DD]
 """
 import argparse
@@ -133,6 +132,7 @@ NOTE_RULES = [
     (re.compile(r"^(\d+) duplicate manga urls"), lambda m: f"Its lists show {m[1]} {'title' if m[1] == '1' else 'titles'} more than once"),
     (re.compile(r"^(\d+) duplicate chapter urls"), lambda m: f"The chapter list repeats {m[1]} {'chapter' if m[1] == '1' else 'chapters'}"),
     (re.compile(r"^\d+ of \d+ \w+ entries with a blank title"), lambda m: "Some titles in its lists have no name"),
+    (re.compile(r"^cloudflare checkbox clicked$"), lambda m: "Cloudflare shows its checkbox: in the app, tick it in WebView"),
 ]
 
 
@@ -166,10 +166,6 @@ def load_smoke_json(json_dir: Path, ext: str):
 
 
 def entry(ext_source_dir, json_dir, config_dir, ext: str, status: str, summary: str, via: str) -> dict:
-    # Note: this function has no concept of a node recheck. A node's result is never merged
-    # here — it's applied straight onto the already-published status.json entries by the
-    # `ingest` workflow (publisher/merge_node_result.py), well after this script has run, since
-    # a node's result can arrive on its own schedule, independent of a daily sweep.
     smoke = load_smoke_json(json_dir, ext)
     pub = {"id": ext, "lang": ext.split("/")[0], **gradle_fields(ext_source_dir, ext)}
     details = next((st for st in (smoke or {}).get("steps", []) if st.get("step") in ("details", "manga")), {})
@@ -208,6 +204,39 @@ def entry(ext_source_dir, json_dir, config_dir, ext: str, status: str, summary: 
     return pub
 
 
+# Fixed sentences for a recheck's verdict: a proxy run's own error text never reaches the page.
+STEP_TEXT = {
+    "browse": "Can’t load its list of titles", "latest": "Latest updates don’t load",
+    "search": "Search doesn’t work", "details": "Titles don’t open",
+    "chapters": "Chapter lists don’t load", "read": "Chapters don’t open", "pages": "Pages don’t load",
+}
+CC = re.compile(r"^[A-Z]{2}$")
+
+
+def apply_recheck(x: dict, r: dict, overridden: bool) -> None:
+    """A recheck's verdict replaces the sweep's. The sweep's ops stay (the page labels them as
+    GitHub's). An untestable-sources.tsv entry only gives way to a pass."""
+    st, step, tags = r.get("status"), r.get("step"), r.get("tags") or []
+    if (st not in ("pass", "partial", "fail", "maybe") or (st in ("partial", "fail") and step not in OPS)
+            or not CC.match(str(r.get("cc", ""))) or not set(tags) <= {t for t, _ in BLOCK_TAGS}
+            or (overridden and st != "pass")):
+        return
+    for k in ("step", "error", "tags"):
+        x.pop(k, None)
+    x.update(status=st, rechecked=True, recheckedFrom=r["cc"])
+    if st in ("partial", "fail"):
+        x.update(step=step, error=f"Also fails through our recheck proxies: {STEP_TEXT[step]}")
+    elif st == "maybe":
+        x["tags"] = [t for t, _ in BLOCK_TAGS if t in tags]
+        x["error"] = ("Cloudflare still blocks our recheck proxies" if "cloudflare" in tags
+                      else "Also blocked through our recheck proxies")
+    notes = [n[:140] for n in r.get("notes") or [] if isinstance(n, str)][:5]
+    if st == "pass" or notes:
+        x.pop("notes", None)
+        if notes:
+            x["notes"] = notes
+
+
 def upgrade_history(codes: str) -> str:
     """Move a published history string to the current letters, restoring scrubbed streaks as
     fails: partial was the only other letter in them, and which one it was is gone."""
@@ -238,12 +267,17 @@ def build(args) -> dict:
     if args.overrides and Path(args.overrides).exists():
         overrides = dict(l.split("\t", 1) for l in Path(args.overrides).read_text().splitlines() if l.strip() and not l.startswith("#"))
 
+    rechecks = json.loads(Path(args.recheck).read_text()) if args.recheck and Path(args.recheck).exists() else {}
+
     exts = []
     for ext, (status, secs, summary, via) in main_rows.items():
         use_status, use_summary, use_via = status, summary, via
         if ext in overrides:
             use_status, use_summary = "untestable", overrides[ext]
-        exts.append(entry(ext_source, json_dir, config_dir, ext, use_status, use_summary, use_via))
+        x = entry(ext_source, json_dir, config_dir, ext, use_status, use_summary, use_via)
+        if isinstance(rechecks.get(ext), dict):
+            apply_recheck(x, rechecks[ext], ext in overrides)
+        exts.append(x)
 
     # 1.4 extensions aren't run by the checker at all; list them so nobody wonders where they went.
     listed = {x["id"] for x in exts}
@@ -265,10 +299,8 @@ def build(args) -> dict:
         x["since"] = hist[x["id"]]["since"]
 
     # 1.6 extensions this run didn't reach (a subset run, or an in-progress partial publish) stay
-    # listed as pending, with fresh gradle fields only, so search still finds them. Deliberately
-    # NOT carrying anything forward from the previous run's entry (ops, error, step,
-    # recheckedOnNode/recheckedOn, ...): a node result (or any other prior-run detail) must never
-    # leak onto a pending entry of a run that hasn't reached that extension yet. The run-history
+    # listed as pending, with fresh gradle fields only, so search still finds them. Nothing is
+    # carried forward from the previous run's entry (ops, error, step, a recheck). The run-history
     # sparkline (built below from history/ext) is how "last known result" actually survives
     # across runs, not this entry.
     listed = {x["id"] for x in exts}
@@ -318,6 +350,7 @@ def main():
     ap.add_argument("--extensions-source", required=True)
     ap.add_argument("--site", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--recheck")
     ap.add_argument("--overrides")
     ap.add_argument("--config-dir")
     ap.add_argument("--previous-status")
@@ -339,7 +372,7 @@ def main():
     index.write_text(html)
     # Backstop: everything written into `data` is already individually scrubbed (load_smoke_json,
     # short_error, notes(), etc.) — this final recursive pass is the "make sure publish applies
-    # the same scrub" net, so nothing raw from a sweep/recheck shard reaches gh-pages even if a
+    # the same scrub" net, so nothing raw from a sweep shard reaches gh-pages even if a
     # future field is added here without its own scrub_text() call.
     (out / "status.json").write_text(json.dumps(scrub_json(data), indent=1, ensure_ascii=False))
     (out / ".nojekyll").write_text("")

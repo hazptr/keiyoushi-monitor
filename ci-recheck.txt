@@ -1,4 +1,4 @@
-# Recheck test: sources the old node usually rescued, plus vi ones still blocked from it.
+# Recheck test: sources a recheck proxy usually rescues, plus vi ones blocked from most exits.
 vi/sayhentai
 en/hivescans
 en/girlstop

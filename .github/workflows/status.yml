@@ -1,8 +1,8 @@
 name: status
 
 # No pull_request / pull_request_target triggers anywhere in this workflow or repo, and no
-# self-hosted runner anywhere either. The recheck runs on GitHub-hosted runners too, sending its
-# traffic through the recheck proxies on the tailnet (see proxy/README.md).
+# self-hosted runner. The recheck runs in the sweep shards, sending its traffic through the recheck
+# proxies (see proxy/README.md).
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -32,7 +32,7 @@ permissions:
 jobs:
   selftest:
     # Cheap, dependency-free scrub/leak-check assertions. Gates publish (via needs:) — a red
-    # selftest means status.json/recheck.json never get published off whatever this run produced.
+    # selftest means status.json never gets published off whatever this run produced.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -273,23 +273,15 @@ jobs:
         run: |
           chmod +x proto/harness/ci/*.sh
           proto/harness/ci/run-shard.sh extensions-source dist "shards/shard-${SHARD}.txt" "out"
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        if: always()
-        with:
-          name: shard-${{ matrix.shard }}-results
-          path: out/
-
       # Recheck, right here: this shard's failures that look like a block (Cloudflare, 403/429,
-      # timeouts, connect errors) go straight back out through the recheck proxies (the tailnet's,
-      # and any public ones in the RECHECK_PROXIES secret), each to a proxy in the country it wants
-      # first (proxy/README.md). Skipped when nothing looks blocked or no proxy is configured.
-      # Only the category-only result is uploaded: the raw logs can carry a proxy's exit IP.
+      # timeouts, connect errors) go back out through the recheck proxies (the tailnet's, and any
+      # public ones in the RECHECK_PROXIES secret), each to a proxy in the country it wants first
+      # (proxy/README.md). Its verdicts land in out/recheck.json; the proxy runs' own logs stay in
+      # recheck-work/, which is never uploaded (they can carry a proxy's exit IP).
       - id: flagged
-        name: pick this shard's failures worth a recheck
+        name: anything worth a recheck
         if: always() && (vars.TS_CLIENT_ID != '' || env.HAS_PUBLIC_PROXIES == 'true')
-        run: |
-          python3 proto/publisher/needs_recheck.py out/results.tsv recheck-shard.txt 300
-          if [ -s recheck-shard.txt ]; then echo "any=1" >> "$GITHUB_OUTPUT"; fi
+        run: python3 proto/harness/ci/recheck.py --any out && echo "any=1" >> "$GITHUB_OUTPUT" || true
       - uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
         if: always() && steps.flagged.outputs.any == '1' && vars.TS_CLIENT_ID != ''
         with:
@@ -304,62 +296,20 @@ jobs:
           EXT_RUN_PREBUILT: "1"
           RECHECK_PROXY_ORDER: ${{ vars.RECHECK_PROXY_ORDER }}
           RECHECK_PROXIES: ${{ secrets.RECHECK_PROXIES }}
-          RUN_ID: ${{ github.run_id }}
-          SHARD: ${{ matrix.shard }}
-        run: |
-          mkdir -p recheck-out
-          python3 proto/harness/ci/recheck.py extensions-source dist recheck-shard.txt "$RUN_ID" \
-            recheck-work "recheck-out/recheck-${SHARD}.json"
+        run: python3 proto/harness/ci/recheck.py extensions-source dist out recheck-work
       - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        if: always() && steps.flagged.outputs.any == '1'
+        if: always()
         with:
-          name: recheck-result-${{ matrix.shard }}
-          path: recheck-out/
-          if-no-files-found: ignore
-
-  classify:
-    needs: sweep
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          path: proto
-          persist-credentials: false
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          pattern: shard-*-results
-          path: shard-results
-      - name: merge results.tsv and json
-        run: |
-          shopt -s nullglob
-          printf 'ext\tstatus\tsecs\tsummary\tvia\n' > results.tsv
-          mkdir -p merged/json
-          for d in shard-results/shard-*-results; do
-            [ -f "$d/results.tsv" ] && tail -n +2 "$d/results.tsv" >> results.tsv
-            [ -d "$d/json" ] && cp "$d"/json/*.json merged/json/ 2>/dev/null || true
-          done
-          cp results.tsv merged/
-      # The same pick each sweep shard made for its own recheck, over the whole run: the ids the
-      # recheck results are allowed to report on (merge_recheck.py in build-site).
-      - name: list the failures the shards rechecked
-        run: python3 proto/publisher/needs_recheck.py results.tsv recheck-list.txt 100000
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        with:
-          name: merged-results
-          path: merged/
-      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        with:
-          name: recheck-list
-          path: recheck-list.txt
+          name: shard-${{ matrix.shard }}-results
+          path: out/
 
   # NO job that holds `contents: write` ever extracts or runs anything an earlier job produced.
-  # `build-site` does all of that (build_status.py, merge_recheck.py) with read-only permissions
+  # `build-site` does all of that (merging the shards, build_status.py) with read-only permissions
   # and uploads the finished site; `deploy` below only downloads it and pushes it.
   build-site:
-    needs: [selftest, validate-inputs, build, classify]
+    needs: [selftest, validate-inputs, build, sweep]
     runs-on: ubuntu-latest
-    if: always() && needs.selftest.result == 'success' && needs.build.result == 'success' && needs.classify.result == 'success'
+    if: always() && needs.selftest.result == 'success' && needs.build.result == 'success'
     permissions:
       contents: read
     steps:
@@ -376,18 +326,19 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          name: merged-results
-          path: merged
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: recheck-list
-          path: .
-      # Absent when no shard rechecked anything; the site still builds.
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        continue-on-error: true
-        with:
-          pattern: recheck-result-*
-          path: recheck-results
+          pattern: shard-*-results
+          path: shard-results
+      - name: merge the shards' results.tsv, json and recheck.json
+        run: |
+          shopt -s nullglob
+          mkdir -p merged/json
+          printf 'ext\tstatus\tsecs\tsummary\tvia\n' > merged/results.tsv
+          for d in shard-results/shard-*-results; do
+            [ -f "$d/results.tsv" ] && tail -n +2 "$d/results.tsv" >> merged/results.tsv
+            [ -d "$d/json" ] && cp "$d"/json/*.json merged/json/ 2>/dev/null || true
+          done
+          python3 -c 'import json, sys; print(json.dumps({k: v for f in sys.argv[1:] for k, v in json.load(open(f)).items()}))' \
+            shard-results/shard-*-results/recheck.json > merged/recheck.json
 
       # Read-only checkout of gh-pages: the history source (previous status.json), read via the checkout action rather than the raw CDN
       # (which can lag or serve a cached-stale copy) — this job never pushes to this branch, only
@@ -411,6 +362,7 @@ jobs:
         run: |
           python3 proto/publisher/build_status.py \
             --results merged/results.tsv \
+            --recheck merged/recheck.json \
             --extensions-source extensions-source \
             --site proto/site \
             --out public \
@@ -419,12 +371,6 @@ jobs:
             --previous-status previous-status.json \
             --kei-commit "$KEI_COMMIT" \
             --run-id "$RUN_ID"
-
-      - name: merge the recheck results
-        run: |
-          mkdir -p recheck-results
-          python3 proto/publisher/merge_recheck.py public/status.json recheck-list.txt recheck-results
-          python3 proto/publisher/leak_check.py public
 
       - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:

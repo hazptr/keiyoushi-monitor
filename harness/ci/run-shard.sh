@@ -55,7 +55,7 @@ while IFS= read -r ext; do
   err_tail=$(tail -3 "$log" 2>/dev/null | tr '\n' ' ')
   python3 "$HERE/make_row.py" "$ext" "$secs" "${EXT_RUN_VIA:-gha}" "$json" "$err_tail" >>"$TSV"
   if [ "${EXT_RUN_QUIET:-}" = "1" ]; then
-    # recheck job: the row's summary can carry raw exception text (URLs, hostnames); never put
+    # recheck.py: the row's summary can carry raw exception text (URLs, hostnames); never put
     # that in the job console, which is public. Status-only line, nothing else.
     echo "[run-shard] $ext -> $(cut -f2 <<<"$(tail -1 "$TSV")")"
   else

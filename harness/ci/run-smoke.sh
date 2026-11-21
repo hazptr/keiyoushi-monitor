@@ -51,15 +51,13 @@ trap 'rm -rf "$DATA"' EXIT
 VERBOSE_FLAG=()
 [ "${EXT_RUN_SMOKE_VERBOSE:-}" = "1" ] && VERBOSE_FLAG=(-v)
 
-# EXT_RUN_JAVA_EXTRA_OPTS: extra JVM flags inserted before -cp, space-separated — e.g. a recheck
-# node sets its heap cap (-Xmx...) and OkHttp's egress-proxy system properties
-# (-Dhttps.proxyHost=... -Dhttps.proxyPort=...) here; OkHttpClient.Builder never calls .proxy(),
-# so it falls back to the JVM's default ProxySelector, which honours these out of the box — no
-# harness code change needed for the proxy itself.
+# EXT_RUN_JAVA_EXTRA_OPTS: extra JVM flags inserted before -cp, space-separated. recheck.py puts
+# the proxy here (-Dhttps.proxyHost=... -Dhttps.proxyPort=...): OkHttpClient.Builder never calls
+# .proxy(), so the JVM's default ProxySelector picks these up.
 read -ra EXTRA_OPTS <<<"${EXT_RUN_JAVA_EXTRA_OPTS:-}"
 
 # config/<lang>_<name>.toml may pin a title to test (smoke_url), for sources with no lists to
-# pick one from (Cubari). Absent (e.g. on a recheck node) = the smoke run picks one itself.
+# pick one from (Cubari). Absent = the smoke run picks one itself.
 CONF=$HERE/../../config/${SRC//\//_}.toml
 SMOKE_URL=
 [ -f "$CONF" ] && SMOKE_URL=$(sed -n 's/^smoke_url *= *"\([^"]*\)".*/\1/p' "$CONF" | head -1)

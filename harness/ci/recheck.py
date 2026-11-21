@@ -14,7 +14,8 @@ IP, and the shard's artifact is public.
 
 Proxies: every online tailnet peer tagged tag:kmon-proxy (the runner joined the tailnet in the step
 before), plus the RECHECK_PROXIES secret (proxy/README.md). Each one's exit country and time zone
-are measured through the proxy itself. An extension goes first to proxies in a country it wants
+are measured through the proxy itself. An extension goes first to proxies in the country its
+recheck last passed from (the previous status.json, RECHECK_PREVIOUS), then a country it wants
 (recheck/geo.tsv, else LANG_COUNTRY), then those named in RECHECK_PROXY_ORDER, then the rest in a
 stable per-extension shuffle that alternates plain and WARP exits. It moves to the next proxy only
 while the result is still a block or an error, at most RECHECK_MAX_TRIES (default 3) proxies.
@@ -157,9 +158,26 @@ def load_geo() -> dict[str, list[str]]:
     return geo
 
 
-def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str]) -> list[dict]:
+def load_worked(path: str) -> dict[str, str]:
+    """ext -> the country its recheck last passed from, out of the previously published status.json
+    (RECHECK_PREVIOUS; absent or unreadable = nothing remembered)."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    worked = {}
+    for x in data.get("extensions", []) if isinstance(data, dict) else []:
+        cc = next((a.get("from") for a in x.get("rechecks") or [] if isinstance(a, dict) and a.get("status") == "pass"), None)
+        if isinstance(x.get("id"), str) and isinstance(cc, str) and re.fullmatch(r"[A-Z]{2}", cc):
+            worked[x["id"]] = cc
+    return worked
+
+
+def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str], worked: dict | None = None) -> list[dict]:
     lang = ext.split("/")[0]
     wanted = geo.get(ext) or ([LANG_COUNTRY[lang]] if lang in LANG_COUNTRY else [])
+    if (worked or {}).get(ext):
+        wanted = [worked[ext]] + [c for c in wanted if c != worked[ext]]
 
     def shuffle(p):
         return hashlib.sha256(f"{ext}|{p['name']}".encode()).hexdigest()
@@ -243,7 +261,8 @@ def main():
     if exts and proxies:
         geo = load_geo()
         ranking = [n.strip() for n in os.environ.get("RECHECK_PROXY_ORDER", "").split(",") if n.strip()]
-        orders = {e: proxy_order(e, proxies, geo, ranking) for e in exts}
+        worked = load_worked(os.environ.get("RECHECK_PREVIOUS", ""))
+        orders = {e: proxy_order(e, proxies, geo, ranking, worked) for e in exts}
         tries = max(1, int(os.environ.get("RECHECK_MAX_TRIES") or 3))
         pending = [e for e in exts if orders[e]]
         for rnd in range(tries):

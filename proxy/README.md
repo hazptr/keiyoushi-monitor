@@ -23,10 +23,11 @@ status.yml  sweep shard: run ──> its blocked-looking failures again (tag:kmo
 2. measures each one's exit country and time zone *through the proxy* (ip-api.com, only the
    country and zone fields), so a proxy's location is never taken on trust, and the job log
    only shows hostname and country, never an IP;
-3. sends each source to proxies in the country it wants first: `recheck/geo.tsv`, else the
+3. sends each source first to proxies in the country its recheck last passed from (read back from
+   the published `status.json`), then the country it wants: `recheck/geo.tsv`, else the
    language's country for languages tied to one (vi→VN, id→ID, th→TH, ko→KR, ja→JP, tr→TR, …);
    then the rest in the order of the `RECHECK_PROXY_ORDER` repo variable (comma-separated
-   hostnames), unlisted ones after by name;
+   hostnames), then a stable shuffle alternating plain and WARP exits;
 4. moves a source on to the next proxy only while its result still looks like a block (blocked,
    cloudflare, timeout, connect). A pass anywhere counts, with the country it passed from.
 

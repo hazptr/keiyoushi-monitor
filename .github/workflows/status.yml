@@ -289,9 +289,21 @@ jobs:
           audience: ${{ vars.TS_AUDIENCE }}
           tags: tag:kmon-ci
           hostname: kmon-ci-${{ github.run_id }}-${{ matrix.shard }}
+      # The previous status.json: a source goes first to proxies in the country its recheck last passed from.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: always() && steps.flagged.outputs.any == '1'
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: gh-pages
+          sparse-checkout: status.json
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          persist-credentials: false
       - name: recheck through the proxies
         if: always() && steps.flagged.outputs.any == '1'
         env:
+          RECHECK_PREVIOUS: gh-pages/status.json
           EXT_RUN_JAVA_BIN: ${{ env.JAVA_HOME_21_X64 }}/bin/java
           EXT_RUN_PREBUILT: "1"
           RECHECK_PROXY_ORDER: ${{ vars.RECHECK_PROXY_ORDER }}

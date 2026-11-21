@@ -8,7 +8,7 @@ Runs in the sweep shard right after run-shard.sh, on the same runner. Reads the 
 results.tsv, sends every failure that looks like a block (BLOCKISH) out through the proxies, and
 writes <shard-out-dir>/recheck.json: per extension the status the page would give the proxy run
 (publisher/build_status.py's own entry()), each step's status word, its failing step, block
-tags, notes and the proxy's country. Nothing else from the proxy run leaves <work-dir>: its raw logs can carry a proxy's exit
+tags, whether Cloudflare's checkbox was ticked and the proxy's country. Nothing else from the proxy run leaves <work-dir>: its raw logs can carry a proxy's exit
 IP, and the shard's artifact is public.
 
 Proxies: every online tailnet peer tagged tag:kmon-proxy (the runner joined the tailnet in the step
@@ -212,9 +212,13 @@ def verdict(wt: str, run_dir: Path, ext: str, status: str, summary: str, cc: str
         if not x["step"]:
             return None
     row = {"status": st, "cc": cc, "ops": [{"op": o["op"], "status": o["status"]} for o in x.get("ops", [])]}
-    for k in ("step", "tags", "notes"):
+    for k in ("step", "tags"):
         if x.get(k):
             row[k] = x[k]
+    smoke = json.loads((run_dir / "json" / f"{ext.replace('/', '_')}.json").read_text() or "{}") \
+        if (run_dir / "json" / f"{ext.replace('/', '_')}.json").exists() else {}
+    if "cloudflare checkbox clicked" in (smoke.get("warnings") or []):
+        row["clicked"] = True
     return row
 
 

@@ -6,7 +6,7 @@ needs nothing but this repo + its Pages branch.
 
 --results-dir holds one dir per shard, as the shard uploaded it: results.tsv, json/ and
 recheck.json, the shard's rechecks through the proxies (harness/ci/recheck.py), an object
-ext -> {status, cc, ops, step?, tags?, notes?}. A recheck's verdict replaces the sweep's.
+ext -> {status, cc, ops, step?, tags?, clicked?}. A recheck's verdict replaces the sweep's.
 
   build_status.py --results-dir DIR --extensions-source DIR --site DIR --out DIR
                    [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
@@ -215,33 +215,38 @@ CC = re.compile(r"^[A-Z]{2}$")
 OP_STATUSES = ("pass", "fail", "maybe", "untestable", "skip", "na")
 
 
-def apply_recheck(x: dict, r: dict, overridden: bool) -> None:
-    """A recheck's verdict replaces the sweep's. The sweep's ops stay (the page labels them as
-    GitHub's); the proxy run's go in recheckOps, status words only. An untestable-sources.tsv
-    entry only gives way to a pass."""
+def apply_recheck(x: dict, r: dict, overridden: bool, date: str) -> None:
+    """A recheck's verdict replaces the sweep's, in the fields status.json has always used for it
+    (other tools read them: keep them stable). The sweep's ops stay (the page labels them as
+    GitHub's); the proxy run's go in recheckOps, status words only. An untestable-sources.tsv entry
+    only gives way to a pass."""
     st, step, tags = r.get("status"), r.get("step"), r.get("tags") or []
     if (st not in ("pass", "partial", "fail", "maybe") or (st in ("partial", "fail") and step not in OPS)
-            or not CC.match(str(r.get("cc", ""))) or not set(tags) <= {t for t, _ in BLOCK_TAGS}
-            or (overridden and st != "pass")):
+            or not CC.match(str(r.get("cc", ""))) or (overridden and st != "pass")):
         return
-    for k in ("step", "error", "tags"):
-        x.pop(k, None)
-    x.update(status=st, rechecked=True, recheckedFrom=r["cc"])
+    x.pop("step", None)
+    old_tags = x.pop("tags", None)
+    x.pop("recheckedFrom", None)
+    if st == "pass":
+        x["status"] = "pass"
+        x.pop("error", None)
+        x["recheckedFrom"] = r["cc"]
+    elif st in ("partial", "fail"):
+        x.update(status="fail", step=step, error=f"Also fails through our recheck proxies: {STEP_TEXT[step]}")
+    elif "cloudflare" in tags:
+        x.update(status="maybe", error="Cloudflare still blocks our recheck proxies", tags=["cloudflare"])
+    else:
+        x.update(status="maybe", error="Also blocked through our recheck proxies",
+                 tags=[t for t in (old_tags or []) if t != "cloudflare"] or ["blocked"])
+    x.update(recheckedOnNode=True, recheckedOn=date)
     ops = [o for o in r.get("ops") or [] if isinstance(o, dict) and o.get("op") in OPS and o.get("status") in OP_STATUSES]
     ops = [{"op": o["op"], "status": o["status"]} for i, o in enumerate(ops) if o["op"] not in [p["op"] for p in ops[:i]]]
     if ops:
         x["recheckOps"] = ops
-    if st in ("partial", "fail"):
-        x.update(step=step, error=f"Also fails through our recheck proxies: {STEP_TEXT[step]}")
-    elif st == "maybe":
-        x["tags"] = [t for t, _ in BLOCK_TAGS if t in tags]
-        x["error"] = ("Cloudflare still blocks our recheck proxies" if "cloudflare" in tags
-                      else "Also blocked through our recheck proxies")
-    notes = [n[:140] for n in r.get("notes") or [] if isinstance(n, str)][:5]
-    if st == "pass" or notes:
-        x.pop("notes", None)
-        if notes:
-            x["notes"] = notes
+    if r.get("clicked") is True:
+        note = "Our recheck proxy run had to click Cloudflare's verification checkbox"
+        if note not in x.setdefault("notes", []):
+            x["notes"].append(note)
 
 
 def upgrade_history(codes: str) -> str:
@@ -286,7 +291,7 @@ def build(args) -> dict:
             use_status, use_summary = "untestable", overrides[ext]
         x = entry(ext_source, shard_of[ext] / "json", config_dir, ext, use_status, use_summary, use_via)
         if isinstance(rechecks.get(ext), dict):
-            apply_recheck(x, rechecks[ext], ext in overrides)
+            apply_recheck(x, rechecks[ext], ext in overrides, args.run_date)
         exts.append(x)
 
     # 1.4 extensions aren't run by the checker at all; list them so nobody wonders where they went.

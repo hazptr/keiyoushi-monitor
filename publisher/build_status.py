@@ -5,8 +5,8 @@ is read back from the currently-published status.json instead of a state directo
 needs nothing but this repo + its Pages branch.
 
 --results-dir holds one dir per shard, as the shard uploaded it: results.tsv, json/ and
-recheck.json, the shard's rechecks through the proxies (harness/ci/recheck.py), an object
-ext -> {status, cc, ops, step?, tags?, clicked?}. A recheck's verdict replaces the sweep's.
+recheck.json, the shard's rechecks through the proxies (harness/ci/recheck.py): ext -> a list of
+{from, status, ops, step?, tags?, ticked?}, one per proxy tried. Their verdict replaces the sweep's.
 
   build_status.py --results-dir DIR --extensions-source DIR --site DIR --out DIR
                    [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
@@ -213,40 +213,52 @@ STEP_TEXT = {
 }
 CC = re.compile(r"^[A-Z]{2}$")
 OP_STATUSES = ("pass", "fail", "maybe", "untestable", "skip", "na")
+RECHECK_STATUSES = ("pass", "fail", "maybe", "error")
 
 
-def apply_recheck(x: dict, r: dict, overridden: bool, date: str) -> None:
-    """A recheck's verdict replaces the sweep's, in the fields status.json has always used for it
-    (other tools read them: keep them stable). The sweep's ops stay (the page labels them as
-    GitHub's); the proxy run's go in recheckOps, status words only. An untestable-sources.tsv entry
-    only gives way to a pass."""
-    st, step, tags = r.get("status"), r.get("step"), r.get("tags") or []
-    if (st not in ("pass", "partial", "fail", "maybe") or (st in ("partial", "fail") and step not in OPS)
-            or not CC.match(str(r.get("cc", ""))) or (overridden and st != "pass")):
+def clean_rechecks(tries) -> list:
+    """recheck.json's list for one extension, checked field by field: only fixed words get through."""
+    out = []
+    for a in tries if isinstance(tries, list) else []:
+        if not isinstance(a, dict) or not CC.match(str(a.get("from", ""))) or a.get("status") not in RECHECK_STATUSES:
+            continue
+        if a["status"] == "fail" and a.get("step") not in OPS:
+            continue
+        ops = [o for o in a.get("ops") or [] if isinstance(o, dict) and o.get("op") in OPS and o.get("status") in OP_STATUSES]
+        row = {"from": a["from"], "status": a["status"],
+               "ops": [{"op": o["op"], "status": o["status"]} for i, o in enumerate(ops) if o["op"] not in [p["op"] for p in ops[:i]]]}
+        if a["status"] == "fail":
+            row["step"] = a["step"]
+        tags = [t for t, _ in BLOCK_TAGS if t in (a.get("tags") or [])]
+        if a["status"] == "maybe" and tags:
+            row["tags"] = tags
+        if a.get("ticked") is True:
+            row["ticked"] = True
+        out.append(row)
+    return out
+
+
+def apply_rechecks(x: dict, tries: list, overridden: bool) -> None:
+    """x["rechecks"] lists every proxy tried. The verdict, a pass anywhere or else the last proxy
+    that could tell (fail or blocked), replaces the sweep's status; the sweep's ops stay (the page
+    labels them as GitHub's). An untestable-sources.tsv entry only gives way to a pass."""
+    if not tries:
         return
-    x.pop("step", None)
-    old_tags = x.pop("tags", None)
-    x.pop("recheckedFrom", None)
-    if st == "pass":
+    x["rechecks"] = tries
+    final = next((a for a in tries if a["status"] == "pass"), None) or \
+        next((a for a in reversed(tries) if a["status"] in ("fail", "maybe")), None)
+    if not final or (overridden and final["status"] != "pass"):
+        return
+    for k in ("step", "error", "tags"):
+        x.pop(k, None)
+    if final["status"] == "pass":
         x["status"] = "pass"
-        x.pop("error", None)
-        x["recheckedFrom"] = r["cc"]
-    elif st in ("partial", "fail"):
-        x.update(status="fail", step=step, error=f"Also fails through our recheck proxies: {STEP_TEXT[step]}")
-    elif "cloudflare" in tags:
+    elif final["status"] == "fail":
+        x.update(status="fail", step=final["step"], error=f"Also fails through our recheck proxies: {STEP_TEXT[final['step']]}")
+    elif "cloudflare" in final.get("tags", []):
         x.update(status="maybe", error="Cloudflare still blocks our recheck proxies", tags=["cloudflare"])
     else:
-        x.update(status="maybe", error="Also blocked through our recheck proxies",
-                 tags=[t for t in (old_tags or []) if t != "cloudflare"] or ["blocked"])
-    x.update(recheckedOnNode=True, recheckedOn=date)
-    ops = [o for o in r.get("ops") or [] if isinstance(o, dict) and o.get("op") in OPS and o.get("status") in OP_STATUSES]
-    ops = [{"op": o["op"], "status": o["status"]} for i, o in enumerate(ops) if o["op"] not in [p["op"] for p in ops[:i]]]
-    if ops:
-        x["recheckOps"] = ops
-    if r.get("clicked") is True:
-        note = "Our recheck proxy run had to click Cloudflare's verification checkbox"
-        if note not in x.setdefault("notes", []):
-            x["notes"].append(note)
+        x.update(status="maybe", error="Also blocked through our recheck proxies", tags=final.get("tags") or ["blocked"])
 
 
 def upgrade_history(codes: str) -> str:
@@ -290,8 +302,8 @@ def build(args) -> dict:
         if ext in overrides:
             use_status, use_summary = "untestable", overrides[ext]
         x = entry(ext_source, shard_of[ext] / "json", config_dir, ext, use_status, use_summary, use_via)
-        if isinstance(rechecks.get(ext), dict):
-            apply_recheck(x, rechecks[ext], ext in overrides, args.run_date)
+        if ext in rechecks:
+            apply_rechecks(x, clean_rechecks(rechecks[ext]), ext in overrides)
         exts.append(x)
 
     # 1.4 extensions aren't run by the checker at all; list them so nobody wonders where they went.

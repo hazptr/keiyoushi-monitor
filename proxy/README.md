@@ -30,9 +30,10 @@ status.yml  sweep shard: run ──> its blocked-looking failures again (tag:kmo
 4. moves a source on to the next proxy only while its result still looks like a block (blocked,
    cloudflare, timeout, connect). A pass anywhere counts, with the country it passed from.
 
-Only the verdict leaves the job (the shard's `recheck.json`: status, each step's status word,
-failing step, block tags, whether Cloudflare's checkbox was ticked, the proxy's country); the page shows those
-steps beside the sweep's own. The proxy runs' logs stay on the runner: they can
+Only each proxy's verdict leaves the job (the shard's `recheck.json`: its country, status, each
+step's status word, failing step or block tags, whether Cloudflare's checkbox was ticked); the
+page lists every proxy a source went through, beside the sweep's own steps. Proxy names are
+never published. The proxy runs' logs stay on the runner: they can
 carry an exit IP (a block page that echoes it) and this repo's artifacts are public.
 
 ## Public proxies

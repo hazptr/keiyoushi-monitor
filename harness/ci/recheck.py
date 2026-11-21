@@ -6,9 +6,10 @@
 
 Runs in the sweep shard right after run-shard.sh, on the same runner. Reads the shard's
 results.tsv, sends every failure that looks like a block (BLOCKISH) out through the proxies, and
-writes <shard-out-dir>/recheck.json: per extension the status the page would give the proxy run
-(publisher/build_status.py's own entry()), each step's status word, its failing step, block
-tags, whether Cloudflare's checkbox was ticked and the proxy's country. Nothing else from the proxy run leaves <work-dir>: its raw logs can carry a proxy's exit
+writes <shard-out-dir>/recheck.json: per extension a list of the proxies it went through, in order,
+each with its country, the status the page gives that run (publisher/build_status.py's own
+entry()), each step's status word, its failing step or block tags, and whether Cloudflare's
+checkbox was ticked. Nothing else from the proxy run leaves <work-dir>: its raw logs can carry a proxy's exit
 IP, and the shard's artifact is public.
 
 Proxies: every online tailnet peer tagged tag:kmon-proxy (the runner joined the tailnet in the step
@@ -16,7 +17,7 @@ before), plus the RECHECK_PROXIES secret (proxy/README.md). Each one's exit coun
 are measured through the proxy itself. An extension goes first to proxies in a country it wants
 (recheck/geo.tsv, else LANG_COUNTRY), then those named in RECHECK_PROXY_ORDER, then the rest in a
 stable per-extension shuffle that alternates plain and WARP exits. It moves to the next proxy only
-while the result still looks like a block, at most RECHECK_MAX_TRIES (default 3) proxies.
+while the result is still a block or an error, at most RECHECK_MAX_TRIES (default 3) proxies.
 The console shows proxy names, countries and status words only.
 """
 import hashlib
@@ -199,26 +200,29 @@ def run_group(proxy: dict, exts: list[str], wt: str, dist: str, out: Path) -> di
     return read_tsv(out / "results.tsv")
 
 
-def verdict(wt: str, run_dir: Path, ext: str, status: str, summary: str, cc: str) -> dict | None:
-    """What the page takes from a proxy run: the fixed fields of build_status.entry() on it.
-    None when the run says nothing about the site (a harness error, or still a timeout/connect
-    failure on a proxy, which is the proxy's network rather than the extension)."""
+def attempt(wt: str, run_dir: Path, ext: str, status: str, summary: str, cc: str) -> dict:
+    """One proxy's result as the page shows it: the fixed fields of build_status.entry() on the run.
+    status: pass, fail (the extension itself, with its step), maybe (blocked: Cloudflare, 403, 429,
+    with tags) or error (a timeout or connect failure through the proxy, or a harness error: says
+    nothing about the site)."""
     x = entry(Path(wt), run_dir / "json", ROOT / "config", ext, status, summary, "proxy")
     st = x["status"]
-    if st not in ("pass", "partial", "fail", "maybe") or (st in ("partial", "fail") and BLOCKISH.search(summary)):
-        return None
-    if st in ("partial", "fail") and not x.get("step"):
-        x["step"] = next((o["op"] for o in x.get("ops", []) if o["status"] == "fail"), None)
-        if not x["step"]:
-            return None
-    row = {"status": st, "cc": cc, "ops": [{"op": o["op"], "status": o["status"]} for o in x.get("ops", [])]}
-    for k in ("step", "tags"):
-        if x.get(k):
-            row[k] = x[k]
-    smoke = json.loads((run_dir / "json" / f"{ext.replace('/', '_')}.json").read_text() or "{}") \
-        if (run_dir / "json" / f"{ext.replace('/', '_')}.json").exists() else {}
-    if "cloudflare checkbox clicked" in (smoke.get("warnings") or []):
-        row["clicked"] = True
+    step = x.get("step") or next((o["op"] for o in x.get("ops", []) if o["status"] == "fail"), None)
+    if st in ("partial", "fail") and step and not BLOCKISH.search(summary):
+        st = "fail"
+    elif st not in ("pass", "maybe"):
+        st = "error"
+    row = {"from": cc, "status": st, "ops": [{"op": o["op"], "status": o["status"]} for o in x.get("ops", [])]}
+    if st == "fail":
+        row["step"] = step
+    if st == "maybe" and x.get("tags"):
+        row["tags"] = x["tags"]
+    smoke = run_dir / "json" / f"{ext.replace('/', '_')}.json"
+    try:
+        if "cloudflare checkbox clicked" in (json.loads(smoke.read_text()).get("warnings") or []):
+            row["ticked"] = True
+    except (OSError, ValueError):
+        pass
     return row
 
 
@@ -229,7 +233,7 @@ def main():
         sys.exit(__doc__)
     wt, dist, out, work = sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
     exts = candidates(out)
-    result: dict[str, dict] = {}
+    result: dict[str, list] = {}
     proxies = [p for p in (probe(p) for p in tailnet_proxies() + public_proxies()) if p]
     proxies = [p for i, p in enumerate(proxies) if p["name"] not in [q["name"] for q in proxies[:i]]]
     for p in proxies:
@@ -253,16 +257,14 @@ def main():
                 run_dir = work / f"r{rnd}-{name}"
                 rows = run_group(proxy, group, wt, dist, run_dir)
                 for e in group:
-                    status, summary = rows.get(e, ("error", ""))
-                    v = verdict(wt, run_dir, e, status, summary, proxy["cc"])
-                    if v:
-                        result[e] = v
-                    if status != "pass" and BLOCKISH.search(summary):
+                    a = attempt(wt, run_dir, e, *rows.get(e, ("error", "")), proxy["cc"])
+                    result.setdefault(e, []).append(a)
+                    if a["status"] in ("maybe", "error"):
                         pending.append(e)
             if not pending:
                 break
     (out / "recheck.json").write_text(json.dumps(result, indent=1))
-    passed = sum(r["status"] == "pass" for r in result.values())
+    passed = sum(any(a["status"] == "pass" for a in tries) for tries in result.values())
     log(f"done: {passed} of {len(exts)} pass through a proxy")
 
 

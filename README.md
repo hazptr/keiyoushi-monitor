@@ -106,8 +106,8 @@ a short scrubbed error, a few plain-language notes), never logs, request bodies,
 timing data.
 
 A recheck goes further: **none of its text is published**. The proxy runs' logs stay on the
-runner, and `recheck.json` holds only the verdict (status, each step's status word, the failing
-step, block tags, whether Cloudflare's checkbox was ticked) and the proxy's country; the page shows a fixed sentence for it.
+runner, and `recheck.json` holds only each proxy's verdict (its country, status, each step's
+status word, the failing step or block tags, whether Cloudflare's checkbox was ticked); the page shows a fixed sentence for it.
 
 ## Credits
 

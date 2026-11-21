@@ -107,12 +107,24 @@
         return r ? { status: r[1], date: r[0] } : null;
     }
 
-    // A recheck through the proxies carries no text of its own: `error` is the fixed sentence
-    // build_status.py wrote for its verdict, and a pass gets this one.
-    const recheckText = (x) =>
-        x.status === 'pass'
-            ? `Works through our recheck proxy${x.recheckedFrom ? ` in ${x.recheckedFrom}` : ''}`
-            : x.error || 'Also blocked through our recheck proxies';
+    // x.rechecks: every recheck proxy tried, in order. A recheck carries no text of its own: `error`
+    // is the fixed sentence build_status.py wrote for its verdict, and a pass gets this one.
+    // Rechecks that all ended in an error (timeouts through the proxy) leave the sweep's verdict.
+    const rechecked = (x) => (x.rechecks || []).some((a) => a.status !== 'error');
+    const RECHECK_STATUS = {
+        pass: 'works',
+        fail: 'fails too',
+        maybe: 'turned away too',
+        error: 'couldn’t reach the site',
+    };
+    const recheckText = (x) => {
+        const passed = x.rechecks.find((a) => a.status === 'pass');
+        return passed ? `Works through our recheck proxy in ${passed.from}` : x.error || 'Also blocked through our recheck proxies';
+    };
+    const recheckLine = (a) =>
+        `${a.from}: ${a.status === 'fail' ? `${RECHECK_STATUS.fail} (${OPS[a.step]?.[1] || a.step})` : RECHECK_STATUS[a.status] || a.status}${
+            a.ticked ? ', after ticking Cloudflare’s checkbox' : ''
+        }`;
 
     // A listing whose first page works but the next doesn't: scrolling stops, the list itself still loads.
     const failText = (o) => (/^Page 2/.test(o.error || '') ? `${OPS[o.op]?.[0] || o.op} stops after page 1` : OPS[o.op]?.[1] || o.op);
@@ -223,8 +235,8 @@
 
     function report(x) {
         const lines = [`${x.name} (${version(x)}): ${LABEL(x.status)}`];
-        if (x.recheckedOnNode) {
-            lines.push(recheckText(x));
+        if (rechecked(x)) {
+            lines.push(recheckText(x), ...x.rechecks.map((a) => `Recheck ${recheckLine(a)}`));
         } else {
             for (const o of x.ops || []) if (['fail', 'maybe'].includes(o.status)) lines.push(`${OPS[o.op]?.[0] || o.op}: ${o.error}`);
             if (!x.ops?.some((o) => ['fail', 'maybe'].includes(o.status)) && x.error) lines.push(x.error);
@@ -251,14 +263,20 @@
                 ),
             );
         }
-        if (x.recheckedOnNode) {
-            // The ops below are what GitHub's servers saw in the same run, so they're labelled rather than hidden.
-            parts.push(el('p', { class: 'panel muted' }, el('b', {}, 'Rechecked through a proxy: '), recheckText(x)));
-            // Only each step's status word comes back from the proxy run, no error text.
-            if (x.recheckOps?.length) parts.push(stepper(x.recheckOps));
+        if (x.rechecks?.length) {
+            // One line and stepper per proxy tried; only status words come back from a proxy run.
+            // The ops below are what GitHub's servers saw in the same run, so they're labelled.
+            parts.push(
+                el(
+                    'div',
+                    { class: 'panel muted' },
+                    el('b', {}, rechecked(x) ? `Rechecked through a proxy: ${recheckText(x)}` : 'Rechecked through our proxies:'),
+                    ...x.rechecks.flatMap((a) => [el('p', { class: 'small' }, recheckLine(a)), ...(a.ops?.length ? [stepper(a.ops)] : [])]),
+                ),
+            );
         }
         if (x.ops?.length) {
-            if (x.recheckedOnNode) parts.push(el('p', { class: 'muted small' }, 'From GitHub’s servers:'));
+            if (x.rechecks?.length) parts.push(el('p', { class: 'muted small' }, 'From GitHub’s servers:'));
             parts.push(stepper(x.ops));
             // Steps skipped because an earlier one failed only repeat that failure, so they're left out.
             const failed = x.ops.some((o) => ['fail', 'maybe'].includes(o.status));
@@ -287,7 +305,7 @@
                     ),
                 );
             }
-        } else if (x.error && !x.recheckedOnNode) {
+        } else if (x.error && !rechecked(x)) {
             parts.push(el('p', { class: 'panel' }, x.error));
         }
         if (x.notes?.length) {
@@ -336,12 +354,12 @@
         const nsfw = x.contentWarning === 'NSFW';
         // A pass through a recheck proxy is still worth a line, so it doesn't look like one that never failed.
         const issue =
-            x.status === 'pass' && !x.recheckedOnNode
+            x.status === 'pass' && !rechecked(x)
                 ? null
                 : el(
                       'span',
                       { class: `issue ${x.status}` },
-                      x.recheckedOnNode ? recheckText(x) : plain(x),
+                      rechecked(x) ? recheckText(x) : plain(x),
                       ...(changedSince(x) ? [el('span', { class: 'since' }, ` · since ${shortDay(x.since)}`)] : []),
                   );
         const det = el(

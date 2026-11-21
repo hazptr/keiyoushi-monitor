@@ -175,9 +175,12 @@ def load_worked(path: str) -> dict[str, str]:
 
 def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str], worked: dict | None = None) -> list[dict]:
     lang = ext.split("/")[0]
-    wanted = geo.get(ext) or ([LANG_COUNTRY[lang]] if lang in LANG_COUNTRY else [])
-    if (worked or {}).get(ext):
-        wanted = [worked[ext]] + [c for c in wanted if c != worked[ext]]
+    geo_wanted = geo.get(ext) or ([LANG_COUNTRY[lang]] if lang in LANG_COUNTRY else [])
+    # A geoOnly proxy (someone's own server) only ever gets sources that want its country by
+    # geo.tsv or language; a country that merely worked before never opens it up.
+    proxies = [p for p in proxies if not p.get("geoOnly") or p["cc"] in geo_wanted]
+    remembered = (worked or {}).get(ext)
+    wanted = ([remembered] if remembered else []) + [c for c in geo_wanted if c != remembered]
 
     def shuffle(p):
         return hashlib.sha256(f"{ext}|{p['name']}".encode()).hexdigest()
@@ -185,7 +188,6 @@ def proxy_order(ext: str, proxies: list[dict], geo: dict, ranking: list[str], wo
     def rank(p):
         return (wanted.index(p["cc"]) if p["cc"] in wanted else len(wanted),
                 ranking.index(p["name"]) if p["name"] in ranking else len(ranking), shuffle(p))
-    proxies = [p for p in proxies if not p.get("geoOnly") or p["cc"] in wanted]
     head = [p for p in sorted(proxies, key=rank) if p["cc"] in wanted or p["name"] in ranking]
     rest = [p for p in proxies if p not in head]
     plain = sorted((p for p in rest if "warp" not in p["name"]), key=shuffle)

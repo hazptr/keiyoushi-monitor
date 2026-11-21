@@ -49,7 +49,8 @@ proxy, a friend's Squid with a password), without the tailnet: put them in the r
 ```
 
 `geoOnly` keeps a proxy to the sources that want its country (someone's personal server, which the
-whole flagged list would get blocked). They're measured and ordered exactly like tailnet proxies (`name` is what `RECHECK_PROXY_ORDER`
+whole flagged list would get blocked): sources whose language points at its country (`vi/` for VN, …) or whose `recheck/geo.tsv` line lists it.
+A country a source merely passed from before never opens a `geoOnly` proxy to it. They're measured and ordered exactly like tailnet proxies (`name` is what `RECHECK_PROXY_ORDER`
 and the job log use). `http://` and `socks5://` proxies (HTTPS sites go through CONNECT). A SOCKS5
 one, or an HTTP one with a login, goes through `harness/ci/proxy_chain.py` on the runner's
 127.0.0.1, because Chrome and the JVM can't send proxy credentials themselves (and the JVM only

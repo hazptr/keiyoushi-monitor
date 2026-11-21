@@ -304,7 +304,7 @@ jobs:
           path: out/
 
   # NO job that holds `contents: write` ever extracts or runs anything an earlier job produced.
-  # `build-site` does all of that (merging the shards, build_status.py) with read-only permissions
+  # `build-site` does all of that (build_status.py over the shards' results) with read-only permissions
   # and uploads the finished site; `deploy` below only downloads it and pushes it.
   build-site:
     needs: [selftest, validate-inputs, build, sweep]
@@ -328,18 +328,6 @@ jobs:
         with:
           pattern: shard-*-results
           path: shard-results
-      - name: merge the shards' results.tsv, json and recheck.json
-        run: |
-          shopt -s nullglob
-          mkdir -p merged/json
-          printf 'ext\tstatus\tsecs\tsummary\tvia\n' > merged/results.tsv
-          for d in shard-results/shard-*-results; do
-            [ -f "$d/results.tsv" ] && tail -n +2 "$d/results.tsv" >> merged/results.tsv
-            [ -d "$d/json" ] && cp "$d"/json/*.json merged/json/ 2>/dev/null || true
-          done
-          python3 -c 'import json, sys; print(json.dumps({k: v for f in sys.argv[1:] for k, v in json.load(open(f)).items()}))' \
-            shard-results/shard-*-results/recheck.json > merged/recheck.json
-
       # Read-only checkout of gh-pages: the history source (previous status.json), read via the checkout action rather than the raw CDN
       # (which can lag or serve a cached-stale copy) — this job never pushes to this branch, only
       # `deploy` does, from its own download of this job's finished artifact.
@@ -361,8 +349,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           python3 proto/publisher/build_status.py \
-            --results merged/results.tsv \
-            --recheck merged/recheck.json \
+            --results-dir shard-results \
             --extensions-source extensions-source \
             --site proto/site \
             --out public \

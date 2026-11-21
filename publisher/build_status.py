@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""build-site job: turn this run's results.tsv into status.json and a copy of site/ ready to
+"""build-site job: turn this run's sweep shards into status.json and a copy of site/ ready to
 deploy. Has no local persistent state — history ("since", run-history strips, previous-run diff)
 is read back from the currently-published status.json instead of a state directory, so a fork
 needs nothing but this repo + its Pages branch.
 
-The sweep shards' rechecks through the proxies (harness/ci/recheck.py) come in as --recheck, a
-JSON object ext -> {status, cc, ops, step?, tags?, notes?}; a recheck's verdict replaces the sweep's.
+--results-dir holds one dir per shard, as the shard uploaded it: results.tsv, json/ and
+recheck.json, the shard's rechecks through the proxies (harness/ci/recheck.py), an object
+ext -> {status, cc, ops, step?, tags?, notes?}. A recheck's verdict replaces the sweep's.
 
-  build_status.py --results TSV --extensions-source DIR --site DIR --out DIR
-                   [--recheck FILE] [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
+  build_status.py --results-dir DIR --extensions-source DIR --site DIR --out DIR
+                   [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
                    [--kei-commit SHA] [--run-id ID] [--progress DONE/TOTAL] [--run-date YYYY-MM-DD]
 """
 import argparse
@@ -265,22 +266,25 @@ def read_tsv(path: Path) -> dict:
 
 def build(args) -> dict:
     ext_source = Path(args.extensions_source)
-    json_dir = Path(args.results).parent / "json"
     config_dir = Path(args.config_dir) if args.config_dir else None
-    main_rows = read_tsv(Path(args.results))
+    main_rows, shard_of, rechecks = {}, {}, {}
+    for tsv in sorted(Path(args.results_dir).glob("*/results.tsv")):
+        rows = read_tsv(tsv)
+        main_rows.update(rows)
+        shard_of.update(dict.fromkeys(rows, tsv.parent))
+        if (tsv.parent / "recheck.json").exists():
+            rechecks.update(json.loads((tsv.parent / "recheck.json").read_text()))
 
     overrides = {}
     if args.overrides and Path(args.overrides).exists():
         overrides = dict(l.split("\t", 1) for l in Path(args.overrides).read_text().splitlines() if l.strip() and not l.startswith("#"))
-
-    rechecks = json.loads(Path(args.recheck).read_text()) if args.recheck and Path(args.recheck).exists() else {}
 
     exts = []
     for ext, (status, secs, summary, via) in main_rows.items():
         use_status, use_summary, use_via = status, summary, via
         if ext in overrides:
             use_status, use_summary = "untestable", overrides[ext]
-        x = entry(ext_source, json_dir, config_dir, ext, use_status, use_summary, use_via)
+        x = entry(ext_source, shard_of[ext] / "json", config_dir, ext, use_status, use_summary, use_via)
         if isinstance(rechecks.get(ext), dict):
             apply_recheck(x, rechecks[ext], ext in overrides)
         exts.append(x)
@@ -352,11 +356,10 @@ def build(args) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results", required=True)
+    ap.add_argument("--results-dir", required=True)
     ap.add_argument("--extensions-source", required=True)
     ap.add_argument("--site", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--recheck")
     ap.add_argument("--overrides")
     ap.add_argument("--config-dir")
     ap.add_argument("--previous-status")

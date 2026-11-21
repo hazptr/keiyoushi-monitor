@@ -33,7 +33,7 @@ be ahead of what the app ships. If something shows as failing here, check it in 
 | `build-runtime` | GitHub-hosted | Builds the harness runtime (the app stand-in). Never touches extension code; its own Gradle cache key. |
 | `build` | GitHub-hosted | Checks out `extensions-source` at main (or a pinned, ancestry-verified SHA) and builds every extension's classpath **once**, with its own (read-only, kei-commit-keyed) Gradle cache. |
 | `sweep` | GitHub-hosted, sharded | Each shard runs the smoke check for its slice — no Gradle, just the already-built classes. One retry after a delay on failure. Then the shard's failures that look like a block (Cloudflare, 403/429, timeouts, connect errors) run again through the recheck proxies, each source in the country it wants first ([`proxy/README.md`](proxy/README.md)); the verdicts go in the shard's `recheck.json`. Skipped while no proxy is configured. |
-| `build-site` | GitHub-hosted, read-only (`contents: read`) | Merges the shards, builds `status.json` (a recheck's verdict replacing the sweep's) + the site, uploads the site as an artifact; never has write access to this repo. |
+| `build-site` | GitHub-hosted, read-only (`contents: read`) | Builds `status.json` from the shards' results (a recheck's verdict replacing the sweep's) + the site, uploads the site as an artifact; never has write access to this repo. |
 | `deploy` | GitHub-hosted, `contents: write` | Only downloads `build-site`'s finished artifact and pushes it to `gh-pages`; it never extracts or executes anything from it. This split is what keeps the one job with push access from ever running a repo script against build output. |
 
 No workflow in this repo has a `pull_request` or `pull_request_target` trigger, and **none of

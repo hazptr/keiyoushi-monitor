@@ -2,7 +2,8 @@
 """Turn one shard's raw results (same results.tsv + json/*.json shape run-shard.sh already
 produces for the GitHub-hosted sweep) into the strict, category-only node payload — the only
 thing that ever leaves the sandbox. Never reads error text into the output: a failing
-extension's row is exactly {id, category, step?, warning?}, nothing else. This is what makes the
+extension's row is exactly {id, category, step?, warning?, ops?}, nothing else, where ops is each
+step's status word (the same words build_status.py gives the sweep's own ops) and nothing more. This is what makes the
 "never free text" rule structural rather than a scrub step trying to catch leaks after the fact.
 
     categorize.py <results.tsv> <json-dir> <run-id> <run-date> <out.json>
@@ -16,6 +17,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_status import operations  # noqa: E402
 from node_schema import validate_node_payload  # noqa: E402
 
 BLOCKED = re.compile(r"\b(?:40[13]|429)\b")
@@ -56,6 +58,12 @@ def categorize_one(status: str, summary: str, smoke: dict | None) -> dict:
     return {"category": "error"}
 
 
+def step_statuses(smoke: dict | None) -> list:
+    """Each step's status word, as build_status.operations() decides it for the sweep; its error
+    and reason text is dropped here, so only the fixed step names and status words come out."""
+    return [{"op": o["op"], "status": o["status"]} for o in operations(smoke)]
+
+
 def warning_tag(smoke: dict | None):
     if smoke and "cloudflare checkbox clicked" in (smoke.get("warnings") or []):
         return "cloudflare checkbox clicked"
@@ -88,6 +96,8 @@ def main():
                 smoke = None
         cat = categorize_one(status, summary, smoke)
         row = {"id": ext, **cat}
+        if ops := step_statuses(smoke):
+            row["ops"] = ops
         warn = warning_tag(smoke)
         if warn:
             row["warning"] = warn

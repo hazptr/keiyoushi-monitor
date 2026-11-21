@@ -49,8 +49,8 @@ see the proxy's public IP**, the same as opening them in a normal browser would.
 to what the recheck is for (some sites only pass from a residential IP, or from one country).
 Extension code itself never runs on a proxy host: it runs on GitHub's runners, which only reach
 the proxies' port 3128 over the tailnet. If a source's recheck result differs from the sweep's,
-the difference can hint at roughly where a proxy is; the report itself carries only a category and
-the proxy's country. See [`proxy/README.md`](proxy/README.md) for the rest.
+the difference can hint at roughly where a proxy is; the report itself carries only a category,
+each step's status word and the proxy's country. See [`proxy/README.md`](proxy/README.md) for the rest.
 
 ## Setting up your own copy
 
@@ -108,8 +108,8 @@ a short scrubbed error, a few plain-language notes), never logs, request bodies,
 timing data.
 
 A recheck's report goes further: it is **never free text in the first place**. Each recheck
-job only emits one of a fixed category enum per extension (`publisher/node_schema.py`), plus the
-proxy's country on a pass, so there's no error message to leak; raw logs never leave the job.
+job only emits one of a fixed category enum per extension (`publisher/node_schema.py`), plus each
+step's status word from another fixed enum and the proxy's country on a pass, so there's no error message to leak; raw logs never leave the job.
 `build-site` re-validates every shard's report before merging it, and the scrub/leak-check runs
 over the result as a backstop.
 

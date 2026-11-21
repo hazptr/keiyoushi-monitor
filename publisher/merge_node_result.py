@@ -93,6 +93,10 @@ def merge(status_data: dict, node_payload: dict, run_date: str | None = None) ->
             x["tags"] = ["cloudflare"]
         x["recheckedOnNode"] = True
         x.pop("recheckedFrom", None)
+        x.pop("recheckOps", None)
+        if row.get("ops"):
+            # The proxy run's own steps. `ops` stays what GitHub's servers saw.
+            x["recheckOps"] = row["ops"]
         if row.get("cc"):
             x["recheckedFrom"] = row["cc"]
         if run_date:

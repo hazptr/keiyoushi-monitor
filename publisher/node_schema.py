@@ -6,7 +6,7 @@
 
 A recheck row is never free text. It is exactly: an extension id that was actually on the day's
 recheck list, a category from CATEGORIES, optionally the one fixed warning tag, on a pass the
-two-letter country of the proxy it passed through, and nothing
+two-letter country of the proxy it passed through, each step's status word from OP_STATUSES, and nothing
 else — no error strings, titles, URLs, or timestamps beyond the run date. This is the fix for a
 real leak found in testing: a free-text recheck error message once revealed wording from a page
 on the node's own network, unrelated to the extension being checked. Categories carry no detail
@@ -17,6 +17,9 @@ import re
 
 # step name, only present when category == "fail" — the op that failed, not why.
 STEPS = ("browse", "latest", "search", "details", "chapters", "read", "pages")
+
+# A step's status word, as build_status.operations() gives it.
+OP_STATUSES = ("pass", "fail", "maybe", "untestable", "skip", "na")
 
 CATEGORIES = ("pass", "fail", "blocked", "cloudflare", "timeout", "connect", "error")
 
@@ -53,7 +56,7 @@ def validate_row(row: dict, allowed_ids: set) -> dict:
     already only have built it this way, but ingest treats this as the authority, not a hint)."""
     if not isinstance(row, dict):
         _fail("row is not an object")
-    extra = set(row) - {"id", "category", "step", "warning", "cc"}
+    extra = set(row) - {"id", "category", "step", "warning", "cc", "ops"}
     if extra:
         _fail(f"row has disallowed field(s): {sorted(extra)}")
     ext = row.get("id")
@@ -76,7 +79,20 @@ def validate_row(row: dict, allowed_ids: set) -> dict:
     cc = row.get("cc")
     if cc is not None and (cat != "pass" or not isinstance(cc, str) or not CC_RE.match(cc)):
         _fail(f"cc {cc!r} must be a two-letter country code, and only on a pass")
+    ops = row.get("ops")
+    if ops is not None:
+        if not isinstance(ops, list) or len(ops) > len(STEPS):
+            _fail("ops is not a list of at most one entry per step")
+        for o in ops:
+            if not isinstance(o, dict) or set(o) != {"op", "status"}:
+                _fail("an ops entry is not exactly {op, status}")
+            if o["op"] not in STEPS or o["status"] not in OP_STATUSES:
+                _fail(f"ops entry {o!r} has an unknown step or status")
+        if len({o["op"] for o in ops}) != len(ops):
+            _fail("ops lists a step twice")
     out = {"id": ext, "category": cat}
+    if ops:
+        out["ops"] = [{"op": o["op"], "status": o["status"]} for o in ops]
     if cc is not None:
         out["cc"] = cc
     if step is not None:

@@ -178,8 +178,8 @@
     const dotClass = (st) => (['skip', 'na'].includes(st) ? 'skip' : st);
 
     // Where in the read path it broke: one chip per operation, in the order the app does them.
-    function stepper(x) {
-        const chips = x.ops.flatMap((o, i) => [
+    function stepper(ops) {
+        const chips = ops.flatMap((o, i) => [
             ...(i ? [el('span', { class: 'sep', 'aria-hidden': 'true' }, '›')] : []),
             el(
                 'span',
@@ -254,10 +254,12 @@
         if (x.rechecked) {
             // The ops below are what GitHub's servers saw in the same run, so they're labelled rather than hidden.
             parts.push(el('p', { class: 'panel muted' }, el('b', {}, 'Rechecked through a proxy: '), recheckText(x)));
+            // Only each step's status word comes back from the proxy run, no error text.
+            if (x.recheckOps?.length) parts.push(stepper(x.recheckOps));
         }
         if (x.ops?.length) {
             if (x.rechecked) parts.push(el('p', { class: 'muted small' }, 'From GitHub’s servers:'));
-            parts.push(stepper(x));
+            parts.push(stepper(x.ops));
             // Steps skipped because an earlier one failed only repeat that failure, so they're left out.
             const failed = x.ops.some((o) => ['fail', 'maybe'].includes(o.status));
             const notes = x.ops.filter((o) => (o.error || o.reason) && !(failed && o.status === 'skip'));

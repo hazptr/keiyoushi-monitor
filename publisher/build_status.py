@@ -5,7 +5,7 @@ is read back from the currently-published status.json instead of a state directo
 needs nothing but this repo + its Pages branch.
 
 The sweep shards' rechecks through the proxies (harness/ci/recheck.py) come in as --recheck, a
-JSON object ext -> {status, cc, step?, tags?, notes?}; a recheck's verdict replaces the sweep's.
+JSON object ext -> {status, cc, ops, step?, tags?, notes?}; a recheck's verdict replaces the sweep's.
 
   build_status.py --results TSV --extensions-source DIR --site DIR --out DIR
                    [--recheck FILE] [--overrides FILE] [--config-dir DIR] [--previous-status FILE]
@@ -211,11 +211,13 @@ STEP_TEXT = {
     "chapters": "Chapter lists don’t load", "read": "Chapters don’t open", "pages": "Pages don’t load",
 }
 CC = re.compile(r"^[A-Z]{2}$")
+OP_STATUSES = ("pass", "fail", "maybe", "untestable", "skip", "na")
 
 
 def apply_recheck(x: dict, r: dict, overridden: bool) -> None:
     """A recheck's verdict replaces the sweep's. The sweep's ops stay (the page labels them as
-    GitHub's). An untestable-sources.tsv entry only gives way to a pass."""
+    GitHub's); the proxy run's go in recheckOps, status words only. An untestable-sources.tsv
+    entry only gives way to a pass."""
     st, step, tags = r.get("status"), r.get("step"), r.get("tags") or []
     if (st not in ("pass", "partial", "fail", "maybe") or (st in ("partial", "fail") and step not in OPS)
             or not CC.match(str(r.get("cc", ""))) or not set(tags) <= {t for t, _ in BLOCK_TAGS}
@@ -224,6 +226,10 @@ def apply_recheck(x: dict, r: dict, overridden: bool) -> None:
     for k in ("step", "error", "tags"):
         x.pop(k, None)
     x.update(status=st, rechecked=True, recheckedFrom=r["cc"])
+    ops = [o for o in r.get("ops") or [] if isinstance(o, dict) and o.get("op") in OPS and o.get("status") in OP_STATUSES]
+    ops = [{"op": o["op"], "status": o["status"]} for i, o in enumerate(ops) if o["op"] not in [p["op"] for p in ops[:i]]]
+    if ops:
+        x["recheckOps"] = ops
     if st in ("partial", "fail"):
         x.update(step=step, error=f"Also fails through our recheck proxies: {STEP_TEXT[step]}")
     elif st == "maybe":

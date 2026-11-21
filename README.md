@@ -106,8 +106,8 @@ a short scrubbed error, a few plain-language notes), never logs, request bodies,
 timing data.
 
 A recheck goes further: **none of its text is published**. The proxy runs' logs stay on the
-runner, and `recheck.json` holds only the verdict (status, the failing step, block tags, notes
-from a fixed list) and the proxy's country; the page shows a fixed sentence for it.
+runner, and `recheck.json` holds only the verdict (status, each step's status word, the failing
+step, block tags, notes from a fixed list) and the proxy's country; the page shows a fixed sentence for it.
 
 ## Credits
 

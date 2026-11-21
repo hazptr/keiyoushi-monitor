@@ -1,7 +1,6 @@
 package android.text
 
 import android.graphics.Canvas
-import android.graphics.Typeface
 import java.awt.Font
 import java.awt.RenderingHints
 import java.awt.font.FontRenderContext
@@ -34,16 +33,7 @@ abstract class Layout protected constructor(
 
     internal open val includePad: Boolean get() = true
 
-    private fun font(): Font {
-        val base = paint.getTypeface()?.awtFont ?: Font(Font.SANS_SERIF, Font.PLAIN, 1)
-        val style = if (paint.getTypeface() === Typeface.DEFAULT_BOLD || base.isBold) Font.BOLD else Font.PLAIN
-        val family = when (paint.getTypeface()) {
-            Typeface.MONOSPACE -> Font(Font.MONOSPACED, style, 1)
-            Typeface.SERIF -> Font(Font.SERIF, style, 1)
-            else -> base.deriveFont(style)
-        }
-        return family.deriveFont(paint.textSize)
-    }
+    private fun font(): Font = paint.awtFont() // same font as Paint.measureText / Canvas.drawText
 
     private fun breakLines(): List<Line> {
         val frc = FontRenderContext(null, true, true)

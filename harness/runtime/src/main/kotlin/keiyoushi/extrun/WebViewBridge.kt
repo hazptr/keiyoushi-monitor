@@ -31,6 +31,7 @@ import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.File
 import java.io.IOException
 import java.net.UnixDomainSocketAddress
@@ -61,19 +62,15 @@ object WebViewBridge {
     private val javaBridge = Executors.newSingleThreadExecutor { Thread(it, "JavaBridge").apply { isDaemon = true } }
     private var channel: SocketChannel? = null
     private var userAgent: String? = null
-    private val cfClicked = java.util.concurrent.atomic.AtomicBoolean(false)
 
     fun register(view: WebView): Int = nextView.getAndIncrement().also { views[it] = view }
-
-    /** Whether a backend reported clicking Cloudflare's Turnstile checkbox since the last call; resets it. */
-    fun consumeCfClicked(): Boolean = cfClicked.getAndSet(false)
 
     /** Stand-in for Mihon's WebViewUtil.supportsWebView: is there a sidecar to talk to. */
     fun available(): Boolean = channel != null || File(sockPath).exists()
 
     fun defaultUserAgent(): String = userAgent ?: request(buildJsonObject {
         put("op", "defaultUserAgent")
-        put("browser", Harness.browser)
+        put("browser", Harness.BROWSER)
     }).jsonPrimitive.content.also { userAgent = it }
 
     fun load(view: WebView, url: String, headers: Map<String, String>) {
@@ -112,6 +109,142 @@ object WebViewBridge {
         }
     }
 
+    // ---- androidx.webkit features (WebViewGlue) ----
+
+    @Volatile private var featureList: Set<String>? = null
+
+    /** The androidx.webkit features the sidecar implements; none if it can't say (Playwright, no sidecar). */
+    fun features(): Set<String> = featureList ?: try {
+        request(buildJsonObject {
+            put("op", "features")
+            put("browser", Harness.BROWSER)
+        }).jsonArray.map { it.jsonPrimitive.content }.toSet()
+    } catch (e: Exception) {
+        emptySet()
+    }.also { featureList = it }
+
+    @Volatile private var uaMetadataDefault: Map<String, Any?>? = null
+
+    /** The engine's own client hints in androidx's map form (WebSettingsCompat.getUserAgentMetadata). */
+    fun defaultUserAgentMetadata(): Map<String, Any?> = uaMetadataDefault ?: run {
+        val m = request(buildJsonObject {
+            put("op", "uaMetadataDefault")
+            put("browser", Harness.BROWSER)
+        }).jsonObject
+        fun s(k: String) = m[k]?.jsonPrimitive?.contentOrNull.orEmpty()
+        val full = m["fullVersionList"]?.jsonArray?.associate { it.jsonObject.str("brand").orEmpty() to it.jsonObject.str("version").orEmpty() }.orEmpty()
+        mapOf(
+            "BRAND_VERSION_LIST" to m["brands"]!!.jsonArray.map {
+                val b = it.jsonObject.str("brand").orEmpty()
+                arrayOf(b, it.jsonObject.str("version").orEmpty(), full[b].orEmpty())
+            }.toTypedArray(),
+            "FULL_VERSION" to s("uaFullVersion"),
+            "PLATFORM" to s("platform"),
+            "PLATFORM_VERSION" to s("platformVersion"),
+            "ARCHITECTURE" to s("architecture"),
+            "MODEL" to s("model"),
+            "MOBILE" to (m["mobile"]?.jsonPrimitive?.booleanOrNull ?: false),
+            "BITNESS" to (s("bitness").toIntOrNull() ?: 0),
+            "WOW64" to (m["wow64"]?.jsonPrimitive?.booleanOrNull ?: false),
+        )
+    }.also { uaMetadataDefault = it }
+
+    /** androidx's map form -> CDP's UserAgentMetadata. */
+    private fun uaMetadataJson(map: Map<String, Any?>) = buildJsonObject {
+        val brands = (map["BRAND_VERSION_LIST"] as? Array<*>).orEmpty().mapNotNull { it as? Array<*> }.filter { it.size >= 3 }
+        putJsonArray("brands") { brands.forEach { b -> add(buildJsonObject { put("brand", b[0].toString()); put("version", b[1].toString()) }) } }
+        putJsonArray("fullVersionList") { brands.forEach { b -> add(buildJsonObject { put("brand", b[0].toString()); put("version", b[2].toString()) }) } }
+        put("fullVersion", map["FULL_VERSION"]?.toString().orEmpty())
+        put("platform", map["PLATFORM"]?.toString().orEmpty())
+        put("platformVersion", map["PLATFORM_VERSION"]?.toString().orEmpty())
+        put("architecture", map["ARCHITECTURE"]?.toString().orEmpty())
+        put("model", map["MODEL"]?.toString().orEmpty())
+        put("mobile", map["MOBILE"] as? Boolean ?: false)
+        put("bitness", (map["BITNESS"] as? Int)?.takeIf { it > 0 }?.toString().orEmpty())
+        put("wow64", map["WOW64"] as? Boolean ?: false)
+    }
+
+    private fun startScriptJson(id: Int, script: String, rules: List<String>) = buildJsonObject {
+        put("id", id)
+        put("source", script)
+        putJsonArray("origins") { rules.forEach { add(JsonPrimitive(it)) } }
+    }
+
+    private fun listenerJson(name: String, rules: List<String>) = buildJsonObject {
+        put("name", name)
+        putJsonArray("origins") { rules.forEach { add(JsonPrimitive(it)) } }
+    }
+
+    fun addStartScript(view: WebView, id: Int, script: String, rules: List<String>) = send(buildJsonObject {
+        put("op", "addStartScript")
+        put("wid", view.id)
+        put("script", startScriptJson(id, script, rules))
+    })
+
+    fun removeStartScript(view: WebView, id: Int) = send(buildJsonObject {
+        put("op", "removeStartScript")
+        put("wid", view.id)
+        put("id", id)
+    })
+
+    fun addMessageListener(view: WebView, name: String, rules: List<String>) = send(buildJsonObject {
+        put("op", "addMessageListener")
+        put("wid", view.id)
+        put("listener", listenerJson(name, rules))
+    })
+
+    fun removeMessageListener(view: WebView, name: String) = send(buildJsonObject {
+        put("op", "removeMessageListener")
+        put("wid", view.id)
+        put("name", name)
+    })
+
+    fun postReply(view: WebView, frameId: String, name: String, data: String, arrayBuffer: Boolean) {
+        if (view.destroyed) return
+        send(buildJsonObject {
+            put("op", "postReply")
+            put("wid", view.id)
+            put("frameId", frameId)
+            put("name", name)
+            put("data", data)
+            put("arrayBuffer", arrayBuffer)
+        })
+    }
+
+    fun setIncludeCookies(view: WebView, include: Boolean) = send(buildJsonObject {
+        put("op", "set")
+        put("wid", view.id)
+        put("includeCookies", include)
+    })
+
+    fun setUserAgentMetadata(view: WebView) {
+        val m = view.getSettings().userAgentMetadataOverride() ?: return
+        send(buildJsonObject {
+            put("op", "set")
+            put("wid", view.id)
+            put("uaMetadata", uaMetadataJson(m))
+        })
+    }
+
+    /** The profile's origin-matched headers changed: every open view gets the new list (new views get it on open). */
+    fun setOriginHeaders() = openViews().forEach { view ->
+        send(buildJsonObject {
+            put("op", "set")
+            put("wid", view.id)
+            put("originHeaders", originHeadersJson())
+        })
+    }
+
+    private fun originHeadersJson() = buildJsonArray {
+        WebViewGlue.originHeaders.forEach { h ->
+            add(buildJsonObject {
+                put("name", h.name)
+                put("value", h.value)
+                putJsonArray("rules") { h.rules.forEach { add(JsonPrimitive(it)) } }
+            })
+        }
+    }
+
     fun stop(view: WebView) = send(buildJsonObject {
         put("op", "stop")
         put("wid", view.id)
@@ -128,6 +261,15 @@ object WebViewBridge {
         put("wid", view.id)
         put("bridges", bridgeDefs(interfaces))
     })
+
+    /** The view's page target in the sidecar's Chrome (for `ext-run cdp`); opens the view if it isn't yet. */
+    fun targetOf(view: WebView): String {
+        ensureOpen(view)
+        return request(buildJsonObject {
+            put("op", "target")
+            put("wid", view.id)
+        }).jsonPrimitive.content
+    }
 
     /** Closes the page and copies its cookies into the jar. */
     fun destroy(view: WebView) {
@@ -227,23 +369,30 @@ object WebViewBridge {
         send(buildJsonObject {
             put("op", "open")
             put("wid", view.id)
-            put("browser", Harness.browser)
+            put("browser", Harness.BROWSER)
             // Sources usually copy their OkHttp User-Agent (the app's default: Android Chrome) into the WebView. On a
             // phone that matches the engine; here the engine is desktop Chrome, and desktop Chrome claiming Android
             // fails Cloudflare's managed check (measured 2026-10-10, README "Parity with the app"). So the app's default
             // UA becomes the browser's own; any other UA a source sets is used as given.
             put("userAgent", s.userAgentOverride()?.takeUnless { it == Harness.userAgent })
             put("javaScriptEnabled", s.javaScriptEnabled)
+            put("tick", Harness.tick)
             put("blockImages", s.blockNetworkImage || !s.loadsImagesAutomatically)
             put("bridges", bridgeDefs(view.jsInterfaces))
-            // Fixtures or --map: every request asks the JVM first; live fills the gaps (and records).
+            // Fixtures or --map: every request asks the JVM first; the network fills the gaps (recorded into
+            // --fixtures) unless --offline. Harness-owned views (the Cloudflare solver) never serve or record.
             put("serve", !view.harnessOwned && (Harness.fixturesDir != null || Harness.urlMap.isNotEmpty()))
-            put("live", view.harnessOwned || Harness.live || Harness.direct)
-            put("record", !view.harnessOwned && Harness.fixturesDir != null && Harness.live)
+            put("live", !Harness.offline)
+            put("record", !view.harnessOwned && Harness.fixturesDir != null && !Harness.offline)
             putJsonArray("cookies") {
                 val now = System.currentTimeMillis()
                 HarnessCookieJar.all().filter { it.expiresAt > now }.forEach { add(cookieJson(it)) }
             }
+            putJsonArray("startScripts") { view.startScripts.forEach { (id, v) -> add(startScriptJson(id, v.first, v.second)) } }
+            putJsonArray("messageListeners") { view.messageListeners.forEach { (n, v) -> add(listenerJson(n, v.first)) } }
+            s.userAgentMetadataOverride()?.let { put("uaMetadata", uaMetadataJson(it)) }
+            put("includeCookies", s.includeCookiesOnIntercept)
+            put("originHeaders", originHeadersJson())
         })
     }
 
@@ -385,10 +534,11 @@ object WebViewBridge {
             "cookies" -> (m["cookies"] as? JsonArray)?.let(::saveCookies)
             "bridge" -> javaBridge.execute { callInterface(view ?: return@execute, m.str("name")!!, m.str("method")!!, m["args"]!!.jsonArray) }
             "log" -> System.err.println("ext-run webview: ${m.str("text")}")
-            "note" -> {
-                val text = m.str("text")
-                System.err.println("ext-run webview: $text")
-                if (text == "clicked Cloudflare's checkbox") cfClicked.set(true)
+            "tick" -> {
+                Harness.turnstileTicks.incrementAndGet()
+                view?.let { it.turnstileTicks++ }
+                val host = m.str("url")?.toHttpUrlOrNull()?.host ?: m.str("url")
+                System.err.println("  ! webview: ticked the Turnstile checkbox on $host (tick ${m.str("n")}; in the app the user taps it)")
             }
             "fatal" -> {
                 System.err.println("ext-run: the webview sidecar couldn't open a page: ${m.str("message")}")
@@ -398,6 +548,26 @@ object WebViewBridge {
         }
         if (view == null || view.destroyed) return
         when (ev) {
+            // <jsObjectName>.postMessage from a page (WebViewCompat.addWebMessageListener): main thread, as on Android.
+            "message" -> {
+                val name = m.str("name").orEmpty()
+                val listener = view.messageListeners[name]?.second ?: return
+                MainThread.post {
+                    if (view.destroyed) return@post
+                    try {
+                        WebViewGlue.deliver(
+                            view, listener, name, m.str("data").orEmpty(),
+                            arrayBuffer = m["arrayBuffer"]?.jsonPrimitive?.booleanOrNull == true,
+                            origin = m.str("origin") ?: "null",
+                            isMainFrame = m["isMainFrame"]?.jsonPrimitive?.booleanOrNull == true,
+                            frameId = m.str("frameId").orEmpty(),
+                        )
+                    } catch (t: Throwable) {
+                        System.err.println("ext-run: a WebMessageListener threw (the app would crash):")
+                        t.printStackTrace()
+                    }
+                }
+            }
             "pageStarted" -> MainThread.post {
                 view.currentUrl = m.str("url")
                 if (!view.destroyed) view.webViewClient.onPageStarted(view, m.str("url"), null)

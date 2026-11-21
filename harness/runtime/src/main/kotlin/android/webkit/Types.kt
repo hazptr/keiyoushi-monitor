@@ -167,6 +167,22 @@ open class WebSettings internal constructor(private val owner: WebView) {
 
     internal fun userAgentOverride(): String? = ua
 
+    // androidx.webkit WebSettingsCompat (keiyoushi.extrun.WebViewGlue).
+    internal var includeCookiesOnIntercept = false
+        set(value) {
+            field = value
+            owner.includeCookiesChanged()
+        }
+    private var uaMetadata: Map<String, Any?>? = null
+
+    /** Client hints: what was set, else the engine's own (androidx's map form). */
+    internal fun userAgentMetadata(): Map<String, Any?> = uaMetadata ?: keiyoushi.extrun.WebViewBridge.defaultUserAgentMetadata()
+    internal fun userAgentMetadataOverride(): Map<String, Any?>? = uaMetadata
+    internal fun setUserAgentMetadata(map: Map<String, Any?>) {
+        uaMetadata = map
+        owner.userAgentMetadataChanged()
+    }
+
     fun setSupportMultipleWindows(support: Boolean) {}
     fun setSupportZoom(support: Boolean) {}
     fun setGeolocationEnabled(flag: Boolean) {}

@@ -24,6 +24,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
     implementation("com.squareup.okhttp3:okhttp-brotli:5.4.0")
     implementation("com.squareup.okhttp3:okhttp-zstd:5.4.0")
+    // HeldCertificate/HandshakeCertificates: the fixture server's per-run CA and per-host certificates.
+    implementation("com.squareup.okhttp3:okhttp-tls:5.4.0")
     implementation("com.squareup.zstd:zstd-kmp-okio:0.4.0")
     // The app provides jsoup at runtime: Mihon v0.20.4 ships 1.23.1 (extensions compile against 1.22.2).
     implementation("org.jsoup:jsoup:1.23.1")
@@ -42,7 +44,13 @@ dependencies {
     // Android's security providers (Conscrypt, BC) accept "AES/CBC/PKCS7Padding" etc.; the JDK's SunJCE
     // doesn't. Registered last (Main.kt), as a fallback for what the JDK lacks.
     implementation("org.bouncycastle:bcprov-jdk18on:1.82")
+    // android.icu is ICU4J repackaged; the android.icu.text shims delegate to it.
+    implementation("com.ibm.icu:icu4j:77.1")
+    // Fixture naming, redaction and --map parsing (gradle test; not part of a run).
+    testImplementation(kotlin("test"))
 }
+
+tasks.test { useJUnitPlatform() }
 
 // Runtime jar + every dependency jar in one dir; ext-run.sh puts <dir>/* on the classpath.
 val dist by tasks.registering(Sync::class) {

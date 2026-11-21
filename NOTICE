@@ -42,4 +42,9 @@ network.JavaScriptEngine, network.HttpException), and the Cash App QuickJS JVM b
 public surface to let a real, unmodified extension's own code run and compile against it, not a
 reimplementation of any Mihon or Android internals.
 
+harness/runtime/src/main/kotlin/android/text/Html.kt, android/util/LruCache.kt and
+android/webkit/URLUtil.kt reproduce the behaviour of the matching Android Open Source Project
+classes (frameworks/base/core/java/android/..., Copyright the Android Open Source Project,
+licensed under the Apache License, Version 2.0); each names its AOSP source in its header.
+
 Files under harness/runtime/src/main/kotlin/keiyoushi/extrun/ are original to this project.

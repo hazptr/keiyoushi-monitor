@@ -15,6 +15,7 @@ IDLE_EXIT_S without connections (ext-run.sh starts it again).
 import asyncio
 import base64
 import json
+import re
 import os
 import secrets
 import shutil
@@ -35,6 +36,22 @@ IDLE_EXIT_S = int(os.environ.get("EXT_RUN_WV_IDLE_EXIT_S") or 60 * 60)
 RECORD_TYPES = {"document", "script", "xhr", "fetch", "stylesheet"}
 WINDOW = (1366, 900)
 VERBOSE = os.environ.get("EXT_RUN_WV_DEBUG") == "1"
+
+# Turnstile ticking (see "Turnstile" in ../PROTOCOL.md): a widget gets this long to clear on its own
+# before the first tick, at most TICK_MAX ticks TICK_GAP_S apart, and the watcher gives up on a page
+# whose widget hasn't been visible for TICK_IDLE_S (after the last tick it keeps pushing a new
+# cf_clearance that long).
+TURNSTILE_HOST = "challenges.cloudflare.com"
+TICK_FIRST_S = 8.0  # Cloudflare's automatic checks clear in 3-7 s; a spinner isn't clicked
+TICK_GAP_S = 8.0
+TICK_MAX = 3
+TICK_IDLE_S = 30.0
+
+# Diagnostics only (EXT_RUN_WV_CF_DEBUG=1): a screenshot + the widget box/click point before and after
+# each tick, to see by eye whether a tick landed and what state it leaves the widget in. No effect at
+# all when unset: this never changes detection or tick behaviour.
+CF_DEBUG = os.environ.get("EXT_RUN_WV_CF_DEBUG") == "1"
+CF_DEBUG_DIR = os.environ.get("EXT_RUN_WV_CF_DEBUG_DIR") or os.path.join(tempfile.gettempdir(), "cf-debug")
 
 # nodriver's launch arguments (nodriver/core/config.py), headed, plus the GPU flags that make WebGL
 # report the real GPU, no background throttling (several WebViews are windows on one screen), and no
@@ -91,30 +108,6 @@ def log(*a):
 def debug(*a):
     if VERBOSE:
         log(*a)
-
-
-# Cloudflare Turnstile: the hidden response input Cloudflare's JS inserts into the top-level
-# document; its parent element is the widget box (the checkbox sits ~28px in from its left edge,
-# vertically centred). Same box whether the widget renders inline or via its challenges.cloudflare.com
-# iframe: the input (and so this rect) always lives in the top-level document, so this is evaluated
-# on the page session, never on a child/iframe session.
-TURNSTILE_BOX_JS = """(() => {
-  const i = document.querySelector('input[name=cf-turnstile-response]');
-  const r = i && i.parentElement.getBoundingClientRect();
-  return r && r.height > 20 ? [r.x, r.y, r.height] : null;
-})()"""
-
-CF_DETECT_S = 8       # how long a Turnstile widget gets to render before this page is given up on
-CF_FIRST_CLICK_S = 5  # let Cloudflare's automatic/managed check clear on its own this long first
-CF_BUDGET_S = 30       # total time (from first detection) to wait for clearance
-CF_RECLICK_S = 8       # minimum gap between clicks
-CF_MAX_CLICKS = 2
-
-# Diagnostics only (EXT_RUN_WV_CF_DEBUG=1): a screenshot + the widget box/click point at four points
-# in handle_turnstile, to see by eye whether a click landed and what state it leaves the widget in.
-# No effect at all when unset -- this never changes detection or click behaviour.
-CF_DEBUG = os.environ.get("EXT_RUN_WV_CF_DEBUG") == "1"
-CF_DEBUG_DIR = os.environ.get("EXT_RUN_WV_CF_DEBUG_DIR") or os.path.join(tempfile.gettempdir(), "cf-debug")
 
 
 def same_url(a, b):
@@ -230,6 +223,9 @@ class Browser:
         if not ws_url:
             raise RuntimeError("chrome didn't open its DevTools port")
         ws = await websockets.connect(ws_url, max_size=None, ping_interval=None)
+        # For drive.py (`ext-run cdp`): the DevTools port, next to the socket, so a held view can be driven.
+        with open(os.path.join(os.path.dirname(SOCK), "chrome.json"), "w") as f:
+            json.dump({"port": port}, f)
         self.cdp = CDP(ws)
         asyncio.ensure_future(self.cdp.run())
         self.user_agent = (await self.cdp.send("Browser.getVersion"))["userAgent"].replace("HeadlessChrome/", "Chrome/")
@@ -359,6 +355,133 @@ def bridge_script(url, bridges):
 }})();"""
 
 
+# androidx.webkit features (see the JVM's WebViewGlue) this backend implements.
+FEATURES = ["DOCUMENT_START_SCRIPT:1", "WEB_MESSAGE_LISTENER", "WEB_MESSAGE_ARRAY_BUFFER", "USER_AGENT_METADATA",
+            "COOKIE_INTERCEPT", "MUTE_AUDIO", "MULTI_PROFILE", "CUSTOM_REQUEST_HEADERS"]
+
+
+def origin_allowed(url, rules):
+    """ALLOWED_JS on this side: does url's origin match one of Android's origin rules."""
+    try:
+        u = urlsplit(url)
+        host, port = (u.hostname or "").lower(), u.port
+    except ValueError:
+        return False
+    default = {"http": 80, "https": 443}.get(u.scheme)
+    for r in rules:
+        if r == "*":
+            return True
+        m = re.match(r"^([a-z][a-z0-9+.-]*)://(\*\.)?([^:/]+)(?::(\d+))?$", r, re.I)
+        if not m or u.scheme != m.group(1).lower():
+            continue
+        if (int(m.group(4)) if m.group(4) else default) != (port or default):
+            continue
+        rh = m.group(3).lower()
+        if (host.endswith("." + rh) if m.group(2) else host == rh):
+            return True
+    return False
+
+
+def origin_headers(st, url):
+    """Profile.setOriginMatchedHeader (CUSTOM_REQUEST_HEADERS): the headers for a request to url."""
+    return {h["name"]: h["value"] for h in st.origin_headers if origin_allowed(url, h["rules"])}
+
+# Android's origin rules ("*", scheme://host[:port], "*." host prefix for subdomains) checked in the page.
+ALLOWED_JS = r"""(o, rules) => rules.some(r => {
+  if (r === '*') return true;
+  const m = /^([a-z][a-z0-9+.-]*):\/\/(\*\.)?([^:/]+)(?::(\d+))?$/i.exec(r);
+  if (!m) return false;
+  let u; try { u = new URL(o); } catch (e) { return false; }
+  const dp = { 'http:': '80', 'https:': '443' };
+  if (u.protocol !== m[1].toLowerCase() + ':') return false;
+  if ((m[4] || dp[u.protocol]) !== (u.port || dp[u.protocol])) return false;
+  const h = u.hostname.toLowerCase(), rh = m[3].toLowerCase();
+  return m[2] ? h.endsWith('.' + rh) : h === rh;
+})"""
+
+
+def start_script_source(source, origins):
+    """addDocumentStartJavaScript: every frame whose origin matches, before the page's scripts. With
+    specific origins the script runs inside an if block (top-level let/const/class become block-scoped)."""
+    if "*" in origins:
+        return source
+    return f"if (({ALLOWED_JS})(location.origin, {json.dumps(origins)})) {{\n{source}\n}}"
+
+
+def listener_script(url, name, origins, evt):
+    """addWebMessageListener: window.<name> with postMessage / onmessage / addEventListener('message') in
+    frames whose origin matches. postMessage goes out like a JS interface call (synchronous XHR to the
+    view's bridge URL, answered by the Fetch handler); replies come back as a CustomEvent on the frame's
+    document, dispatched from an isolated world (no Runtime.enable)."""
+    return f"""(() => {{
+  if (!(({ALLOWED_JS})(location.origin, {json.dumps(origins)}))) return;
+  const U = {json.dumps(url)}, NAME = {json.dumps(name)}, EVT = {json.dumps(evt)};
+  const XHR = XMLHttpRequest, open = XHR.prototype.open, send = XHR.prototype.send, call = Function.prototype.call;
+  const stringify = JSON.stringify, parse = JSON.parse, top = window === window.top;
+  const listeners = new Set(); let onmessage = null;
+  const b64 = buf => {{ let s = ''; const a = new Uint8Array(buf); for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return btoa(s); }};
+  const unb64 = s => {{ const t = atob(s), a = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) a[i] = t.charCodeAt(i); return a.buffer; }};
+  const obj = {{
+    postMessage(data) {{
+      const buf = data instanceof ArrayBuffer;
+      const body = stringify({{ k: 'm', name: NAME, data: buf ? b64(data) : String(data), arrayBuffer: buf, origin: location.origin, top }});
+      try {{ const x = new XHR(); call.call(open, x, 'POST', U, false); call.call(send, x, body); }} catch (e) {{}}
+    }},
+    addEventListener(type, fn) {{ if (type === 'message' && typeof fn === 'function') listeners.add(fn); }},
+    removeEventListener(type, fn) {{ if (type === 'message') listeners.delete(fn); }},
+    get onmessage() {{ return onmessage; }},
+    set onmessage(fn) {{ onmessage = typeof fn === 'function' ? fn : null; }},
+  }};
+  document.addEventListener(EVT, e => {{
+    let d; try {{ d = parse(e.detail); }} catch (err) {{ return; }}
+    const ev = new MessageEvent('message', {{ data: d.b ? unb64(d.d) : d.d }});
+    for (const fn of [onmessage, ...listeners]) if (fn) try {{ fn.call(obj, ev); }} catch (err) {{ setTimeout(() => {{ throw err; }}); }}
+  }});
+  Object.defineProperty(window, NAME, {{ value: obj, configurable: true, writable: true }});
+}})();"""
+
+
+UA_META = None
+
+
+async def ua_metadata_default():
+    """The browser's own client hints (navigator.userAgentData), read once from a page on a secure origin
+    the Fetch handler answers itself (userAgentData needs a secure context; nothing goes to the network)."""
+    global UA_META
+    if UA_META:
+        return UA_META
+    b = await get_browser()
+    ctx = (await b.cdp.send("Target.createBrowserContext", {"disposeOnDetach": True}))["browserContextId"]
+    context_opened()
+    try:
+        target = (await b.cdp.send("Target.createTarget", {"url": "about:blank", "browserContextId": ctx}))["targetId"]
+        sid = (await b.cdp.send("Target.attachToTarget", {"targetId": target, "flatten": True}))["sessionId"]
+
+        def on_event(method, p):
+            if method == "Fetch.requestPaused":
+                b.cdp.fire("Fetch.fulfillRequest", fulfil_params(p["requestId"], {
+                    "status": 200, "contentType": "text/html", "body": ""}), sid)
+        b.cdp.handlers[sid] = on_event
+        await b.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "https://ext-run.invalid/*"}]}, sid)
+        await b.cdp.send("Page.navigate", {"url": "https://ext-run.invalid/ua"}, sid)
+        expr = ("navigator.userAgentData.getHighEntropyValues(['architecture','bitness','model','platformVersion',"
+                "'uaFullVersion','fullVersionList','wow64']).then(v => JSON.stringify(v))")
+        for _ in range(50):
+            r = await b.cdp.send("Runtime.evaluate", {"expression": "location.href", "returnByValue": True}, sid)
+            if r.get("result", {}).get("value", "").startswith("https://ext-run.invalid/"):
+                break
+            await asyncio.sleep(0.1)
+        r = await b.cdp.send("Runtime.evaluate", {"expression": expr, "awaitPromise": True, "returnByValue": True}, sid)
+        UA_META = json.loads(r["result"]["value"])
+        return UA_META
+    finally:
+        try:
+            await b.cdp.send("Target.disposeBrowserContext", {"browserContextId": ctx})
+        except CDPError:
+            pass
+        context_closed()
+
+
 STRINGIFY = "function () { try { const s = JSON.stringify(this); return s === undefined ? 'null' : s; } catch (e) { return 'null'; } }"
 
 
@@ -416,7 +539,13 @@ class View:
         self.target = None
         self.session = None
         self.sessions = set()
-        self.scripts = []      # init scripts, applied to every page/iframe session
+        self.scripts = []      # (key, source) init scripts, applied to every page/iframe session; key None = not removable
+        self.script_ids = {}   # (session, key) -> CDP script identifier, for removal
+        self.listeners = {}    # web message listener name -> event name its replies are dispatched as
+        self.frame_sid = {}    # frameId -> the session it posted a message from (replies go back there)
+        self.include_cookies = bool(m.get("includeCookies"))
+        self.ua_metadata = m.get("uaMetadata")
+        self.origin_headers = m.get("originHeaders") or []  # [{name, value, rules}], the profile's origin-matched headers
         self.bridge_url = BRIDGE_URL + secrets.token_hex(8)
         self.url = "about:blank"
         self.via = {}          # (networkId, url) -> via
@@ -425,7 +554,10 @@ class View:
         self.recording = set()  # record tasks still reading bodies; close waits for them
         self.ready = None
         self.b = None
-        self.cf_task = None  # the Cloudflare Turnstile watcher for the current page, if any
+        self.tick = m.get("tick") is not False  # tick Turnstile checkboxes the way the app's user would
+        self.tick_task = None
+        self.ticks = 0  # Turnstile ticks on this view, across watcher restarts (TICK_MAX is per view)
+        self.clearance_sent = set()  # cf_clearance (domain, value) pairs already pushed after a tick
 
 
 class Client:
@@ -467,6 +599,10 @@ class Client:
                 self.send({"ev": "log", "wid": st.wid, "text": f"cookies not copied: {e}"})
         if m.get("bridges"):
             self.add_bridges(st, m["bridges"], apply=False)
+        for s in m.get("startScripts") or []:
+            self.add_start_script(st, s, apply=False)
+        for listener in m.get("messageListeners") or []:
+            self.add_listener(st, listener, apply=False)
         sid = (await b.cdp.send("Target.attachToTarget", {"targetId": st.target, "flatten": True}))["sessionId"]
         st.session = sid
         await self.setup_session(st, sid, "page")
@@ -484,8 +620,8 @@ class Client:
             send("Network.setBypassServiceWorker", {"bypass": True}),
             send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}),
         ]
-        if st.user_agent:
-            cmds.append(send("Network.setUserAgentOverride", {"userAgent": st.user_agent}))
+        if st.user_agent or st.ua_metadata:
+            cmds.append(send("Network.setUserAgentOverride", self.ua_override(st)))
         if kind == "page":
             # Only the page (and its in-process frames): bypassing CSP inside an out-of-process
             # iframe makes Cloudflare's Turnstile frame fail its managed challenge (checked on
@@ -500,9 +636,16 @@ class Client:
             ]
             if not st.js:
                 cmds.append(send("Emulation.setScriptExecutionDisabled", {"value": True}))
-            for src in st.scripts:
+            keyed = []
+            for key, src in st.scripts:
                 cmds.append(send("Page.addScriptToEvaluateOnNewDocument", {"source": src}))
+                keyed.append((len(cmds) - 1, key))
+        else:
+            keyed = []
         res = await asyncio.gather(*cmds, return_exceptions=True)
+        for i, key in keyed:
+            if key is not None and isinstance(res[i], dict):
+                st.script_ids[(sid, key)] = res[i].get("identifier")
         errs = [r for r in res if isinstance(r, Exception)]
         if errs and kind == "page":
             raise errs[0]
@@ -511,10 +654,61 @@ class Client:
 
     def add_bridges(self, st, bridges, apply=True):
         src = bridge_script(st.bridge_url, bridges)
-        st.scripts.append(src)
+        st.scripts.append((None, src))
         if apply:
             for sid in list(st.sessions):
                 st.b.cdp.fire("Page.addScriptToEvaluateOnNewDocument", {"source": src}, sid)
+
+    def ua_override(self, st):
+        params = {"userAgent": st.user_agent or st.b.user_agent}
+        if st.ua_metadata:
+            params["userAgentMetadata"] = st.ua_metadata
+        return params
+
+    def add_script(self, st, key, src, apply):
+        st.scripts.append((key, src))
+        if not apply:
+            return
+
+        async def add(sid):
+            try:
+                r = await st.b.cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": src}, sid)
+                st.script_ids[(sid, key)] = r.get("identifier")
+            except CDPError:
+                pass
+        for sid in list(st.sessions):
+            asyncio.ensure_future(add(sid))
+
+    def remove_script(self, st, key):
+        st.scripts = [(k, s) for k, s in st.scripts if k != key]
+        for sid in list(st.sessions):
+            ident = st.script_ids.pop((sid, key), None)
+            if ident:
+                st.b.cdp.fire("Page.removeScriptToEvaluateOnNewDocument", {"identifier": ident}, sid)
+
+    def add_start_script(self, st, s, apply=True):
+        self.add_script(st, ("start", s["id"]), start_script_source(s["source"], s.get("origins") or ["*"]), apply)
+
+    def add_listener(self, st, listener, apply=True):
+        name, evt = listener["name"], "ext-run-message-" + secrets.token_hex(6)
+        st.listeners[name] = evt
+        self.add_script(st, ("listener", name), listener_script(st.bridge_url, name, listener.get("origins") or ["*"], evt), apply)
+
+    async def post_reply(self, st, m):
+        evt = st.listeners.get(m["name"])
+        if not evt:
+            return
+        frame = m["frameId"]
+        sid = st.frame_sid.get(frame, st.session)
+        cdp = st.b.cdp
+        detail = json.dumps({"d": m["data"], "b": bool(m.get("arrayBuffer"))})
+        try:
+            ctx = (await cdp.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "ext-run-reply"}, sid))["executionContextId"]
+            await cdp.send("Runtime.evaluate", {
+                "expression": f"document.dispatchEvent(new CustomEvent({json.dumps(evt)}, {{ detail: {json.dumps(detail)} }}))",
+                "contextId": ctx}, sid)
+        except CDPError as e:
+            self.send({"ev": "log", "wid": st.wid, "text": f"reply to {m['name']} not delivered: {e}"})
 
     def gone(self, st, sid, kind):
         st.sessions.discard(sid)
@@ -610,111 +804,117 @@ class Client:
             pass
         if not st.closed:
             self.send({"ev": "pageFinished", "wid": st.wid, "url": url})
-        self.watch_turnstile(st)
 
-    # ---- Cloudflare Turnstile: click the "Verify you are human" checkbox like the app's user does.
-    #
-    # From GitHub Actions runner IPs, Cloudflare shows this interactive checkbox instead of clearing
-    # automatically; from a home IP it usually clears on its own. Only ever acts on a Turnstile widget
-    # it finds on the page (see TURNSTILE_BOX_JS) -- nothing here can fire against an unrelated page.
+    # ---- Turnstile: tick the checkbox like the app's user does
 
     def watch_turnstile(self, st):
-        if st.cf_task and not st.cf_task.done():
-            st.cf_task.cancel()
-        st.cf_task = asyncio.ensure_future(self.handle_turnstile(st))
+        """Started by the page's first request to Cloudflare's challenge host; pages without a
+        Turnstile widget never get here, so nothing is ever clicked on them."""
+        if st.ticks < TICK_MAX and (st.tick_task is None or st.tick_task.done()):
+            st.tick_task = asyncio.ensure_future(self.tick_turnstile(st))
 
     async def turnstile_box(self, st):
-        """The widget's (x, y, height) in viewport coordinates, or None. Evaluated on the top-level
-        page session only: the hidden response input Cloudflare injects always lives in the
-        top-level document, whether the widget itself renders inline or via its own iframe."""
+        """The Turnstile iframe's box (x, y, width, height) in the page's viewport, or None while there
+        is none or it isn't shown. The DOM is read pierced (the widget sits in a closed shadow root on
+        Cloudflare's own pages), on the page session, without Runtime."""
+        cdp, sid = st.b.cdp, st.session
         try:
-            r = await st.b.cdp.send("Runtime.evaluate", {"expression": TURNSTILE_BOX_JS, "returnByValue": True}, st.session)
+            root = (await cdp.send("DOM.getDocument", {"depth": -1, "pierce": True}, sid))["root"]
         except CDPError:
             return None
-        v = (r.get("result") or {}).get("value")
-        return tuple(v) if v else None
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if n.get("nodeName") == "IFRAME":
+                attrs = n.get("attributes", [])
+                src = next((attrs[i + 1] for i in range(0, len(attrs) - 1, 2) if attrs[i] == "src"), "")
+                if urlsplit(src).hostname == TURNSTILE_HOST:
+                    try:
+                        await cdp.send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": n["backendNodeId"]}, sid)
+                        m = (await cdp.send("DOM.getBoxModel", {"backendNodeId": n["backendNodeId"]}, sid))["model"]
+                    except CDPError:
+                        continue  # display:none (an interaction-only widget that needs nothing yet)
+                    q = m["content"]
+                    if m["width"] >= 100 and m["height"] >= 40:
+                        return q[0], q[1], m["width"], m["height"]
+            stack += n.get("children", []) + n.get("shadowRoots", []) + ([n["contentDocument"]] if "contentDocument" in n else [])
+        return None
 
-    async def cf_cleared(self, st):
-        if st.closed or not st.ctx:
-            return True
-        try:
-            cookies = (await st.b.cdp.send("Storage.getCookies", {"browserContextId": st.ctx}))["cookies"]
-        except Exception:
-            return False
-        return any(c.get("name") == "cf_clearance" for c in cookies)
+    async def click(self, st, x, y):
+        """A user's tap with a mouse: in from the side, a pause, press, release; on the page session
+        (CDP routes it into the widget's frame). The window comes to the front first, as the WebView a
+        user taps is the one on screen."""
+        cdp, sid = st.b.cdp, st.session
+        await cdp.send("Page.bringToFront", None, sid)
+        await cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x - 60, "y": y + 25}, sid)
+        await asyncio.sleep(0.12)
+        await cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, sid)
+        await asyncio.sleep(0.2)
+        for kind in ("mousePressed", "mouseReleased"):
+            await cdp.send("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, "button": "left", "clickCount": 1}, sid)
+            await asyncio.sleep(0.09)
+
+    async def push_clearance(self, st):
+        """After a tick, a new cf_clearance goes to the JVM's jar at once (a `cookies` event), as the app's
+        CookieManager has it the moment the WebView does: the page it unlocks may not fire `load` for
+        a long time (ads), and a user who ticked doesn't wait for that."""
+        cookies = (await st.b.cdp.send("Storage.getCookies", {"browserContextId": st.ctx}))["cookies"]
+        clearance = {(c["domain"], c["value"]) for c in cookies if c["name"] == "cf_clearance"}
+        if clearance - st.clearance_sent:
+            st.clearance_sent = clearance
+            self.send({"ev": "cookies", "wid": st.wid, "cookies": [proto_cookie(c) for c in cookies]})
 
     async def cf_debug_shot(self, st, stage, box=None, point=None):
-        """Diagnostics only: a screenshot of the top-level page plus the widget box/click point and
-        cf_clearance state, saved under CF_DEBUG_DIR. No-op unless EXT_RUN_WV_CF_DEBUG=1."""
+        """Diagnostics only: a screenshot of the page plus the widget box/click point, saved under
+        CF_DEBUG_DIR. No-op unless EXT_RUN_WV_CF_DEBUG=1."""
         if not CF_DEBUG or st.closed or not st.b:
             return
-        cleared = await self.cf_cleared(st)
         try:
             os.makedirs(CF_DEBUG_DIR, exist_ok=True)
             r = await st.b.cdp.send("Page.captureScreenshot", {"format": "png"}, st.session)
             path = os.path.join(CF_DEBUG_DIR, f"wid{st.wid}-{stage}.png")
             with open(path, "wb") as f:
                 f.write(base64.b64decode(r["data"]))
-            log(f"cf-debug: wid={st.wid} stage={stage} box={box} click_point={point} cf_clearance={cleared} -> {path}")
+            log(f"cf-debug: wid={st.wid} stage={stage} box={box} click_point={point} -> {path}")
         except Exception as e:
-            log(f"cf-debug: wid={st.wid} stage={stage} box={box} click_point={point} cf_clearance={cleared} (screenshot failed: {e})")
+            log(f"cf-debug: wid={st.wid} stage={stage} box={box} click_point={point} (screenshot failed: {e})")
 
-    async def click_turnstile(self, st, box):
-        """A move, a short pause, then press/release -- a realistic sequence, not a single synthetic
-        click -- at the checkbox inside the widget box, on the top-level page session."""
-        x, y, h = box
-        px, py = x + 28, y + h / 2
-        cdp, sid = st.b.cdp, st.session
+    async def tick_turnstile(self, st):
+        """While the page shows a Turnstile widget: let it clear on its own for TICK_FIRST_S, then tick
+        its checkbox (28 px in from the left, vertically centred), at most TICK_MAX times per view. Each
+        tick is reported (`tick` event) so a ticked pass is never mistaken for one that needed no user.
+        After a tick, a new cf_clearance is pushed to the JVM as soon as it appears."""
+        shown_at, last_seen, last_tick = None, time.monotonic(), 0.0
         try:
-            await cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": px, "y": py, "button": "none"}, sid)
-            await asyncio.sleep(0.15)
-            await cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": px, "y": py, "button": "left", "clickCount": 1}, sid)
-            await asyncio.sleep(0.08)
-            await cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": px, "y": py, "button": "left", "clickCount": 1}, sid)
-            return True
-        except CDPError as e:
-            debug(f"turnstile click failed: {e}")
-            return False
-
-    async def handle_turnstile(self, st):
-        task = asyncio.current_task()
-
-        def alive():
-            return not st.closed and st.cf_task is task
-
-        start = time.monotonic()
-        box = None
-        # Most pages never show a Turnstile widget; give one a little time to render (it can appear
-        # after the load event) and move on if it never does.
-        while alive() and time.monotonic() - start < CF_DETECT_S:
-            if await self.cf_cleared(st):
-                return
-            box = await self.turnstile_box(st)
-            if box:
-                break
-            await asyncio.sleep(1)
-        if not box:
-            return
-        await self.cf_debug_shot(st, "detected", box=box)
-
-        clicks = 0
-        next_click = start + CF_FIRST_CLICK_S  # let the automatic/managed check clear on its own first
-        while alive() and time.monotonic() - start < CF_BUDGET_S:
-            if await self.cf_cleared(st):
-                return
-            if clicks < CF_MAX_CLICKS and time.monotonic() >= next_click:
-                box = await self.turnstile_box(st) or box  # the widget can re-render between clicks
-                point = (box[0] + 28, box[1] + box[2] / 2)
-                await self.cf_debug_shot(st, f"before-click{clicks + 1}", box=box, point=point)
-                if await self.click_turnstile(st, box):
-                    clicks += 1
-                    self.send({"ev": "note", "wid": st.wid, "text": "clicked Cloudflare's checkbox"})
-                    await asyncio.sleep(2)
-                    await self.cf_debug_shot(st, f"after-click{clicks}", box=box, point=point)
-                next_click = time.monotonic() + CF_RECLICK_S
-            await asyncio.sleep(1)
-        if not await self.cf_cleared(st):
-            await self.cf_debug_shot(st, "giveup", box=box)
+            while not st.closed:
+                now = time.monotonic()
+                box = await self.turnstile_box(st) if st.ticks < TICK_MAX else None
+                if box is None:
+                    shown_at = None
+                    if now - last_seen > TICK_IDLE_S:
+                        return
+                else:
+                    last_seen = now
+                    shown_at = shown_at or now
+                    if now - shown_at >= TICK_FIRST_S and now - last_tick >= TICK_GAP_S:
+                        x, y, w, h = box
+                        await self.cf_debug_shot(st, f"before-tick{st.ticks + 1}", box, (x + 28, y + h / 2))
+                        await self.click(st, x + 28, y + h / 2)
+                        st.ticks += 1
+                        last_tick = last_seen = time.monotonic()
+                        self.send({"ev": "tick", "wid": st.wid, "url": st.url, "n": st.ticks})
+                        if CF_DEBUG:
+                            await asyncio.sleep(2)
+                        await self.cf_debug_shot(st, f"after-tick{st.ticks}", box, (x + 28, y + h / 2))
+                if st.ticks:
+                    await self.push_clearance(st)
+                await asyncio.sleep(1)
+        except (CDPError, KeyError, ValueError) as e:
+            debug(f"turnstile watcher stopped: {e}")
+        finally:
+            # getDocument turned the DOM agent on; its events would keep coming for the page's life.
+            if not st.closed:
+                st.b.cdp.fire("DOM.disable", None, st.session)
 
     # ---- network bookkeeping (the `net`, `error` and `record` events)
 
@@ -726,6 +926,8 @@ class Client:
         url = req["url"] + req.get("urlFragment", "")
         if url.startswith(("data:", "blob:", BRIDGE_URL)) or self.favicon(p.get("type"), url):
             return
+        if st.tick and urlsplit(url).hostname == TURNSTILE_HOST:
+            self.watch_turnstile(st)
         # Keyed by requestId alone: for an out-of-process iframe the request starts on the parent's
         # session and finishes on the child's.
         key = p["requestId"]
@@ -807,15 +1009,28 @@ class Client:
         try:
             if url.startswith(st.bridge_url):
                 try:
-                    name, meth, args = json.loads(self.post_data(req) and base64.b64decode(self.post_data(req)) or b"")
-                    self.send({"ev": "bridge", "wid": st.wid, "name": name, "method": meth, "args": args})
-                except ValueError:
+                    body = json.loads(self.post_data(req) and base64.b64decode(self.post_data(req)) or b"")
+                    if isinstance(body, dict) and body.get("k") == "m":
+                        if body.get("name") in st.listeners:
+                            st.frame_sid[p.get("frameId")] = sid
+                            self.send({"ev": "message", "wid": st.wid, "name": body["name"], "data": body.get("data", ""),
+                                       "arrayBuffer": bool(body.get("arrayBuffer")), "origin": body.get("origin"),
+                                       "isMainFrame": bool(body.get("top")), "frameId": p.get("frameId")})
+                    else:
+                        name, meth, args = body
+                        self.send({"ev": "bridge", "wid": st.wid, "name": name, "method": meth, "args": args})
+                except (ValueError, TypeError):
                     pass
                 return await cdp.send("Fetch.fulfillRequest", fulfil_params(rid, {
                     "status": 204, "headers": {"Access-Control-Allow-Origin": "*"}}), sid)
             if p.get("redirectedRequestId"):
                 # A redirect hop goes on to the network without asking the JVM, as with Playwright.
                 mark("live")
+                extra = origin_headers(st, url)
+                if extra:
+                    merged = {k.lower(): v for k, v in req.get("headers", {}).items()}
+                    merged.update({k.lower(): v for k, v in extra.items()})
+                    return await cdp.send("Fetch.continueRequest", {"requestId": rid, "headers": header_list(merged)}, sid)
                 return await cdp.send("Fetch.continueRequest", {"requestId": rid}, sid)
             if self.favicon(rtype, url):
                 # Headed Chrome fetches favicons from the browser process; a WebView doesn't.
@@ -834,6 +1049,14 @@ class Client:
             post = self.post_data(req)
             if nid:
                 st.via[(nid, url, "req")] = {"headers": headers, "postData": post}
+            if st.include_cookies:
+                # WebSettingsCompat.setIncludeCookiesOnIntercept: the request's cookies in its intercept headers.
+                try:
+                    cs = (await cdp.send("Network.getCookies", {"urls": [url]}, sid))["cookies"]
+                    if cs:
+                        headers = {**headers, "Cookie": "; ".join(f"{c['name']}={c['value']}" for c in cs)}
+                except CDPError:
+                    pass
             info = {"url": url, "method": req.get("method", "GET"), "headers": headers, "isMainFrame": main,
                     "isRedirect": bool(p.get("redirectedRequestId")), "type": rtype}
             intercepted = await self.ask({"ev": "intercept", "wid": st.wid, "req": info})
@@ -849,9 +1072,13 @@ class Client:
                     mark("miss")
                     return await cdp.send("Fetch.failRequest", {"requestId": rid, "errorReason": "InternetDisconnected"}, sid)
             mark("live")
+            extra = {}
             if main and st.nav_headers and same_url(url, st.nav_headers["url"]):
                 extra, st.nav_headers = st.nav_headers["headers"], None
-                merged = {k.lower(): v for k, v in headers.items()}
+            # The profile's origin-matched headers go on every request to a matching origin, over loadUrl's.
+            extra = {**extra, **origin_headers(st, url)}
+            if extra:
+                merged = {k.lower(): v for k, v in req.get("headers", {}).items()}
                 for k, v in extra.items():
                     merged[k.lower()] = v
                 return await cdp.send("Fetch.continueRequest", {"requestId": rid, "headers": header_list(merged)}, sid)
@@ -900,6 +1127,10 @@ class Client:
             return None
         if op == "defaultUserAgent":
             return (await get_browser()).user_agent
+        if op == "features":
+            return FEATURES
+        if op == "uaMetadataDefault":
+            return await ua_metadata_default()
 
         st = self.views.get(m.get("wid"))
         if st is None:
@@ -909,6 +1140,30 @@ class Client:
         if op == "set":
             if "blockImages" in m:
                 st.block_images = bool(m["blockImages"])
+            if "includeCookies" in m:
+                st.include_cookies = bool(m["includeCookies"])
+            if "originHeaders" in m:
+                st.origin_headers = m["originHeaders"] or []
+            if "uaMetadata" in m:
+                st.ua_metadata = m["uaMetadata"]
+                for s in list(st.sessions):
+                    cdp.fire("Network.setUserAgentOverride", self.ua_override(st), s)
+            return None
+        if op == "addStartScript":
+            self.add_start_script(st, m["script"])
+            return None
+        if op == "removeStartScript":
+            self.remove_script(st, ("start", m["id"]))
+            return None
+        if op == "addMessageListener":
+            self.add_listener(st, m["listener"])
+            return None
+        if op == "removeMessageListener":
+            st.listeners.pop(m["name"], None)
+            self.remove_script(st, ("listener", m["name"]))
+            return None
+        if op == "postReply":
+            await self.post_reply(st, m)
             return None
         if op == "load":
             if m["url"] == "about:blank":
@@ -950,6 +1205,8 @@ class Client:
             return None
         if op == "close":
             return await self.close_view(st)
+        if op == "target":
+            return st.target
         raise RuntimeError(f"unknown op {op}")
 
     async def set_content(self, st, html):
@@ -1007,8 +1264,8 @@ class Client:
 
     async def close_view(self, st):
         self.views.pop(st.wid, None)
-        if st.cf_task and not st.cf_task.done():
-            st.cf_task.cancel()
+        if st.tick_task:
+            st.tick_task.cancel()
         await self.settle(st)
         st.closed = True
         cookies = []

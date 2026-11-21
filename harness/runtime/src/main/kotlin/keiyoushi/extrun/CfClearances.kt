@@ -65,14 +65,13 @@ object CfClearances {
 
     // ---- persistence: {"<cookie domain>": {"ua", "value", "hostOnly", "path", "expiresAt", "secure", "httpOnly", "solvedAt"}} ----
 
-    /** Loads stored clearances into the cookie jar (live and --direct runs only). */
+    /** Loads stored clearances into the cookie jar. */
     fun load() = ensureLoaded()
 
     @Synchronized
     private fun ensureLoaded() {
         if (loaded) return
         loaded = true
-        if (!Harness.live && !Harness.direct) return
         val now = System.currentTimeMillis()
         read().forEach { (domain, e) ->
             val o = e.jsonObject

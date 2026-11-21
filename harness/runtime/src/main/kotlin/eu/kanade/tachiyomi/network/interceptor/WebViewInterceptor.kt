@@ -12,7 +12,6 @@ import android.content.Context
 import android.webkit.CookieManager
 import android.webkit.WebSettings
 import android.webkit.WebView
-import keiyoushi.extrun.Transport
 import keiyoushi.extrun.WebViewBridge
 import okhttp3.Headers
 import okhttp3.Interceptor
@@ -63,11 +62,10 @@ abstract class WebViewInterceptor(
     }
 
     /**
-     * ext-run: every place Mihon calls `chain.proceed(request)` calls this. With --direct/--app it is
-     * exactly `chain.proceed(request)` (plus a log line); otherwise it is the harness transport
-     * (fixtures, --map, curl-impersonate), see keiyoushi.extrun.Transport.
+     * ext-run: every place Mihon calls `chain.proceed(request)` calls this; CloudflareInterceptor adds the
+     * solving browser's UA. Requests are logged further down the chain (keiyoushi.extrun.Transport.RequestLog).
      */
-    protected open fun proceed(chain: Interceptor.Chain, request: Request): Response = Transport.proceed(chain, request)
+    protected open fun proceed(chain: Interceptor.Chain, request: Request): Response = chain.proceed(request)
 
     fun parseHeaders(headers: Headers): Map<String, String> {
         return headers

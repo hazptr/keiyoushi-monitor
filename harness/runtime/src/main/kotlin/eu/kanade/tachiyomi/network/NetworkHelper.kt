@@ -11,12 +11,12 @@ import android.content.Context
 import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
 import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
 import eu.kanade.tachiyomi.network.interceptor.UserAgentInterceptor
+import keiyoushi.extrun.FixtureServer
 import keiyoushi.extrun.Harness
+import keiyoushi.extrun.Transport
 import okhttp3.Cache
-import okhttp3.Dns
 import okhttp3.OkHttpClient
 import java.io.File
-import java.net.UnknownHostException
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -33,7 +33,8 @@ class NetworkHelper(
             .cookieJar(cookieJar)
             .connectTimeout(30.seconds)
             .readTimeout(30.seconds)
-            .callTimeout(2.minutes)
+            // ext-run: no call timeout with --pause, so a held challenge isn't cut off at 2 min (README "Holding a WebView").
+            .callTimeout(if (keiyoushi.extrun.Hold.pause) kotlin.time.Duration.ZERO else 2.minutes)
             .cache(
                 Cache(
                     directory = File(context.getCacheDir(), "network_cache"), // ext-run: the shim has no cacheDir property
@@ -46,12 +47,13 @@ class NetworkHelper(
         // ext-run: verbose HTTP logging and DoH are off by default in the app and are not ported
         // (preferences.verboseLogging == false, preferences.dohProvider == -1).
 
-        // ext-run: outside --direct/--app the network is the harness transport inside
-        // CloudflareInterceptor (fixtures, --map, curl-impersonate); nothing may reach the network
-        // through OkHttp itself. A source that removes the CloudflareInterceptor fails loudly here.
-        if (!Harness.direct) {
-            builder.dns(Dns { host -> throw UnknownHostException("ext-run: direct OkHttp network disabled (host $host); use --direct, or the source removed CloudflareInterceptor") })
-        }
+        // ext-run: with --fixtures, --offline or --map every connection goes to the harness's fixture
+        // server instead of the site (socket factory, DNS and trust; keiyoushi.extrun.FixtureServer).
+        // Sources build their clients on this one, so they inherit it; the app chain above is unchanged.
+        if (Harness.fixtureServer) FixtureServer.install(builder)
+        // ext-run: the request log and count (keiyoushi.extrun.Transport), as a network interceptor so it
+        // sees every request whichever application interceptors a source keeps.
+        builder.addNetworkInterceptor(Transport.RequestLog)
         builder
     }
 

@@ -7,6 +7,7 @@ import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.SourceFactory
 import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
@@ -22,7 +23,9 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.protobuf.ProtoBuf
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.api.addSingleton
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -34,32 +37,48 @@ private const val USAGE = """usage: ext-run [options] --class <source class> <co
 commands:
   popular [page]              getPopularManga
   latest [page]               getLatestUpdates
-  search <query> [page]       getSearchManga with the source's default filters
+  search <query> [page]       getSearchManga with the source's filters (defaults, or as set with --filter;
+                               '' as query browses with filters, like the app's filter sheet)
   url <http-url> [page]       getSearchManga(query = url): KeiSource URL-search / deeplink path
   manga <manga-url>           getMangaUpdate(details + chapters); an http(s) URL is resolved via `url` first
   details <manga-url>         getMangaUpdate(fetchDetails only)
   chapters <manga-url>        getMangaUpdate(fetchChapters only)
-  pages <chapter-url>         getPageList; a full URL on baseUrl is reduced to its path
-  filters                     print getFilterList()
+  pages <chapter-url> [memo]  getPageList; a full URL on baseUrl is reduced to its path; memo = the chapter's memo JSON.
+                               --images N: then load the first N images as the reader does (as smoke's pages step;
+                               written to EXT_RUN_SAVE_IMAGES when set, which alone loads 2)
+  filters [--fetch]           print getFilterList() (after any --filter); --fetch waits for fetchFilterData first
   related <manga-url>         fetchRelatedMangaList (Komikku related manga)
   sources                     list the sources the class provides
+  browse [url]                open url (default baseUrl) in a WebView and hold it for `ext-run cdp <token> ...` until
+                               `ext-run resume <token>`: log in / pass checks; cookies kept with --cookies FILE
   smoke [manga-url]           every user-facing op, each with its own pass/fail/skip: browse, latest,
                                search, details, chapters, read (page list), pages (2 images through
                                source.client); always prints one JSON object, exit 0 = no op failed (see README)
 options:
-  --fixtures DIR   serve responses from DIR (with --live: record misses into DIR)
-  --direct, --app  app parity: plain OkHttp through the ported Mihon network stack (the app's UA,
-                   cookie jar, cache, CloudflareInterceptor). What ext-monitor uses
-  --live           fetch misses with curl-impersonate (Firefox fingerprint, like site-fetch); for
-                   investigating a site, NOT app behaviour (browser TLS passes where the app is blocked)
-  --refresh        with --fixtures --live: re-fetch and overwrite existing fixtures
-  --map URL=FILE   serve one URL from a file (e.g. a saved sample)
+  Every run goes through the ported Mihon network stack (the app's UA, cookie jar, cache,
+  CloudflareInterceptor + WebView, the source's interceptors). Fixtures sit under it, at the socket.
+  --fixtures DIR   replay what DIR has; record misses into DIR (what the app put on the wire, raw response)
+  --offline        no network at all: a request without a fixture fails, naming the expected file
+  --refresh        with --fixtures: re-fetch and overwrite existing fixtures
+  --map URL=FILE[:STATUS]  serve one URL from a file: a body (a fixture's .meta is honoured) or a raw HTTP
+                   response (status line, headers, blank line, body bytes); :STATUS sets the status
+  --fixture-ignore-param NAME  leave query parameter NAME out of fixture names (repeatable); timestamp-valued
+                   cache busters (retry=, t=, _=, ts= ...) are always left out
+  --direct, --app  accepted, no effect (the app's stack is the only mode)
   --pref K=V       seed SharedPreferences (all files)
   --source NAME    pick a source from a SourceFactory (name, lang or id)
+  --filter SPEC    set a filter for search/filters, as in the app's sheet (repeatable; names and options match
+                   case-insensitively, exact first, else a unique substring):
+                     Name=Option        Select, Sort (Option:asc for ascending), Text (Name=text)
+                     Name               CheckBox on / TriState include      !Name  CheckBox off / TriState exclude
+                     Group=Child, Group/Child[=include|exclude|true|false]  an item inside a Group
+                     Child              an item inside a Group, when the name is unique; Select also takes #index
+  --page N         the page for popular, latest, search and url (default 1; same as their [page] argument)
+  --fetch-filters  wait for fetched filter data (KeiSource fetchFilterData) before building the filters; a
+                   --filter that the initial list lacks waits for them by itself on a source that fetches filters
   --json           JSON output (default: readable text)
   --all            text mode: print every item, not just the first/last few
   --limit N        text mode list limit (default 40)
-  --keep-ua        --live: send the source's User-Agent instead of curl's Firefox one
   -v               verbose source logs (android.util.Log d/i/v)"""
 
 private class Opts {
@@ -69,6 +88,10 @@ private class Opts {
     var all = false
     var limit = 40
     val rest = mutableListOf<String>()
+    val filterSpecs = mutableListOf<String>()
+    var fetchFilters = false
+    var page: Int? = null
+    var images: Int? = null
 }
 
 fun main(args: Array<String>) {
@@ -79,27 +102,45 @@ fun main(args: Array<String>) {
         when (val a = args[i]) {
             "--class" -> o.cls = next()
             "--fixtures" -> Harness.fixturesDir = File(next())
-            "--live" -> Harness.live = true
+            "--offline" -> Harness.offline = true
             "--refresh" -> Harness.refresh = true
-            "--direct", "--app" -> Harness.direct = true
-            "--map" -> next().let { Harness.urlMap[it.substringBeforeLast('=')] = File(it.substringAfterLast('=')) }
+            "--direct", "--app" -> Unit // the app's stack is the only mode
+            "--live", "--keep-ua" -> die("ext-run: $a is gone: ext-run always runs the app's network stack; look at a site with browser TLS via site-fetch", 2)
+            "--map" -> next().let { spec ->
+                if ('=' !in spec) die("--map takes URL=FILE[:STATUS]")
+                var file = spec.substringAfterLast('=')
+                // FILE:STATUS, unless the whole thing names a file.
+                val code = Regex(":([1-5][0-9][0-9])$").find(file)?.takeIf { !File(file).exists() }?.let { m ->
+                    file = file.removeSuffix(m.value)
+                    m.groupValues[1].toInt()
+                }
+                Harness.urlMap[Transport.mapKey(spec.substringBeforeLast('='))] = MapEntry(File(file), code)
+            }
+            "--fixture-ignore-param" -> Harness.ignoreParams += next()
+            "--images" -> o.images = next().toIntOrNull()?.takeIf { it >= 1 } ?: die("--images takes a count from 1")
+            "--fetch" -> o.fetchFilters = true // `filters --fetch`
             "--pref" -> next().let { Harness.prefOverrides[it.substringBefore('=')] = it.substringAfter('=') }
             "--source" -> o.sourceSel = next()
+            "--filter" -> o.filterSpecs += next()
+            "--fetch-filters" -> o.fetchFilters = true
+            "--page" -> o.page = next().toIntOrNull()?.takeIf { it >= 1 } ?: die("--page takes a page number from 1")
             "--json" -> o.json = true
             "--all" -> o.all = true
             "--limit" -> o.limit = next().toInt()
-            "--keep-ua" -> Harness.keepUserAgent = true
-            "--browser" -> Harness.browser = next()
+            // Only "chrome" (nodriver), which direct callers of the runtime may still pass.
+            "--browser" -> next().let { if (it != Harness.BROWSER) die("ext-run: --browser $it is gone: the WebView is always nodriver (real Chrome)", 2) }
             "-v" -> Harness.verbose = true
             "-h", "--help" -> die(USAGE, 0)
-            else -> o.rest += a
+            "--" -> { o.rest += args.drop(i + 1); i = args.size }
+            // A mistyped or unsupported option would otherwise become an argument (a search query, a URL).
+            else -> if (a.startsWith("--")) die("ext-run: unknown option $a (use -- before an argument that starts with --)\n$USAGE") else o.rest += a
         }
         i++
     }
     Log.quiet = !Harness.verbose
     val cls = o.cls ?: die(USAGE)
     if (o.rest.isEmpty()) die(USAGE)
-    if (!Harness.live && !Harness.direct && Harness.fixturesDir == null && Harness.urlMap.isEmpty()) Harness.live = true
+    if (Harness.refresh && (Harness.offline || Harness.fixturesDir == null)) die("ext-run: --refresh needs --fixtures and the network (not --offline)", 2)
 
     // What Android's runtime sets up before any app code runs.
     // http.agent: Dalvik's default ("Dalvik/2.1.0 (Linux; U; Android <release>; <model> Build/<id>)"), from the Build shim.
@@ -117,7 +158,13 @@ fun main(args: Array<String>) {
     Injekt.addSingleton(Json { ignoreUnknownKeys = true; explicitNulls = false })
     Injekt.addSingleton<ProtoBuf>(ProtoBuf)
     Injekt.addSingleton(NetworkHelper(app))
+    // The app is open on a screen: one resumed Activity, for code that shows UI over the foreground Activity. With
+    // EXT_RUN_TICK=0 nobody is looking, as for a background job: no Activity, so UI that needs the user fails fast.
+    if (Harness.tick) {
+        MainThread.executor.submit { android.app.ActivityThread.currentActivityThread().launchActivity(app, app.getBaseContext()!!) }.get()
+    }
     CfClearances.load()
+    HarnessCookieJar.load()
 
     val t0 = System.nanoTime()
     val code = try {
@@ -142,6 +189,9 @@ fun main(args: Array<String>) {
         .take(6).joinToString { (k, v) -> "$k x$v" }
     val webview = Transport.webviewCount.get().takeIf { it > 0 }?.let { " + $it webview request(s) [$wvKeys${if (Transport.webviewKeys.toSet().size > 6) ", ..." else ""}]" }.orEmpty()
     System.err.println("-- ${Transport.requestCount.get()} request(s)${if (byKey.isEmpty()) "" else " [$byKey]"}$webview, ${ms}ms in source code + transport")
+    if (FixtureServer.started) System.err.println(FixtureServer.summary())
+    WebViewBridge.pullCookies()
+    HarnessCookieJar.save()
     WebViewBridge.shutdown()
     System.out.flush()
     exitProcess(code)
@@ -184,7 +234,7 @@ private suspend fun run(source: Source, all: List<Source>, o: Opts): Int {
     val args = o.rest
     val cmd = args[0]
     fun arg(n: Int) = args.getOrNull(n) ?: die("$cmd: missing argument #$n\n$USAGE")
-    fun page(n: Int) = args.getOrNull(n)?.toInt() ?: 1
+    fun page(n: Int) = o.page ?: args.getOrNull(n)?.toInt() ?: 1
     System.err.println("source: ${source.name} (${(source as? CatalogueSource)?.lang}) id=${source.id} ${source.base().orEmpty()}")
 
     when (cmd) {
@@ -193,10 +243,10 @@ private suspend fun run(source: Source, all: List<Source>, o: Opts): Int {
         }) { all.joinToString("\n") { "${it.name}\t${(it as? CatalogueSource)?.lang}\t${it.id}\t${it.base()}" } }
         "popular" -> printPage(o, source.getPopularManga(page(1)))
         "latest" -> printPage(o, source.getLatestUpdates(page(1)))
-        "search" -> printPage(o, source.getSearchManga(page(2), arg(1), source.getFilterList()))
+        "search" -> printPage(o, source.getSearchManga(page(2), arg(1), buildFilters(source, o)))
         "url" -> printPage(o, source.getSearchManga(page(2), arg(1), source.getFilterList()))
         "manga", "details", "chapters" -> {
-            val manga = SManga.create().apply { url = resolveMangaUrl(source, arg(1)) }
+            val manga = resolveManga(source, arg(1))
             val update = source.getMangaUpdate(manga, emptyList(), cmd != "chapters", cmd != "details")
             printManga(o, update.manga, update.chapters.takeIf { cmd != "details" })
         }
@@ -204,33 +254,220 @@ private suspend fun run(source: Source, all: List<Source>, o: Opts): Int {
             val chapter = SChapter.create().apply {
                 url = stripBase(source, arg(1))
                 name = "ext-run"
+                args.getOrNull(2)?.let { memo = Json.parseToJsonElement(it) as JsonObject }
             }
-            printPages(o, source, source.getPageList(chapter))
+            val pages = source.getPageList(chapter)
+            val n = o.images ?: 2.takeIf { !System.getenv("EXT_RUN_SAVE_IMAGES").isNullOrEmpty() }
+            if (n == null) {
+                printPages(o, source, pages)
+            } else {
+                // Images as the reader loads them; a bad one is reported with the page list and fails the run.
+                val warnings = mutableListOf<String>()
+                val loaded = runCatching { loadPageImages(source, pages, warnings, n) }
+                printPages(o, source, pages, ImageCheck(loaded.getOrNull(), loaded.exceptionOrNull()?.let { "${it::class.simpleName}: ${it.message}" }, warnings))
+                if (loaded.isFailure) return 1
+            }
         }
-        "filters" -> printFilters(o, source.getFilterList())
+        "filters" -> {
+            printFilters(o, buildFilters(source, o))
+        }
         "related" -> {
-            val manga = SManga.create().apply { url = resolveMangaUrl(source, arg(1)) }
+            val manga = resolveManga(source, arg(1))
             printPage(o, MangasPage((source as CatalogueSource).fetchRelatedMangaList(manga), false))
         }
         "smoke" -> return runSmoke(source, args.getOrNull(1))
+        "browse" -> return browse(source, args.getOrNull(1))
         else -> die("unknown command '$cmd'\n$USAGE")
     }
     return 0
 }
 
-private fun stripBase(source: Source, u: String): String {
-    val base = source.base() ?: return u
-    return if (u.startsWith(base)) u.removePrefix(base).ifEmpty { "/" } else u
+// ---------- browse: a WebView held open to log in or pass a check, its cookies kept for later runs ----------
+
+/**
+ * Opens [urlArg] (default: the source's baseUrl) in a WebView of the sidecar, as the user opens the source's site in
+ * the app's WebView screen, and holds it until `ext-run resume`. Its cookies go into the jar (kept in `--cookies FILE`),
+ * and a cf_clearance it earned is kept with the browser's UA like a solved challenge (CfClearances).
+ */
+private fun browse(source: Source, urlArg: String?): Int {
+    val url = urlArg ?: source.base() ?: die("browse: give a url (the source has no baseUrl)")
+    val app = Injekt.get<android.app.Application>()
+    val view = MainThread.executor.submit<android.webkit.WebView> {
+        android.webkit.WebView(app).apply {
+            harnessOwned = true // never served from or recorded into fixtures
+            getSettings().javaScriptEnabled = true
+            getSettings().domStorageEnabled = true
+            loadUrl(url)
+        }
+    }.get()
+    if (System.getenv("EXT_RUN_COOKIES").isNullOrEmpty()) {
+        System.err.println("  ! browse without --cookies FILE: only cf_clearance is kept after this run, a login is lost")
+    }
+    val hold = Hold.announce(view, "browse: log in or pass the site's checks, then resume")
+    Hold.await(hold)
+    val last = view.getUrl()
+    WebViewBridge.cookiesOf(view)
+    MainThread.executor.submit { view.destroy() }.get()
+    listOfNotNull(url, last).mapNotNull { it.toHttpUrlOrNull() }.distinctBy { it.host }.forEach(CfClearances::solved)
+    val kept = HarnessCookieJar.all().filter { it.expiresAt > System.currentTimeMillis() }
+    kept.groupBy { it.domain }.toSortedMap().forEach { (domain, cs) ->
+        System.err.println("cookies: $domain: ${cs.map { it.name }.distinct().sorted().joinToString(", ")}")
+    }
+    System.err.println(
+        if (System.getenv("EXT_RUN_COOKIES").isNullOrEmpty()) {
+            "browse: done; cf_clearance (if any) is kept for this exit, other cookies are dropped"
+        } else {
+            "browse: done; ${kept.size} cookie(s) kept: run with the same --cookies FILE (and VPN exit) to use them"
+        },
+    )
+    return 0
 }
 
-private suspend fun resolveMangaUrl(source: Source, arg: String): String {
-    if (!arg.startsWith("http://") && !arg.startsWith("https://")) return arg
+// ---------- --filter: set filters the way a user does in the filter sheet ----------
+
+// KeiSource fetches filter data in the background and caches it; waiting for that cache lets the fetched
+// lists (genres, ...) be checked and used here instead of on a device.
+private fun waitForFilterData(source: Source) {
+    source.getFilterList() // starts the fetch
+    val cache = Harness.dataDir.resolve("cache/source_${source.id}/filters.json.zst")
+    val deadline = System.currentTimeMillis() + 60_000
+    while (!cache.exists() && System.currentTimeMillis() < deadline && !filterFetchFailed(source)) Thread.sleep(250)
+    if (!cache.exists()) System.err.println("filters: no fetched filter data (fetchFilterData failed or took over 60 s, or the source doesn't fetch filters)")
+}
+
+/** KeiSource's protected `supportsFilterFetching`: does the source build its filters from fetched data. */
+private fun supportsFilterFetching(source: Source): Boolean = keiSourceMember(source) { c ->
+    c.getDeclaredMethod("getSupportsFilterFetching").apply { isAccessible = true }.invoke(source) as Boolean
+} ?: false
+
+/** KeiSource counts failed background fetches; the first failure ends the wait (the app would show the hint). */
+private fun filterFetchFailed(source: Source): Boolean = keiSourceMember(source) { c ->
+    (c.getDeclaredField("filterFetchAttemptCount").apply { isAccessible = true }.get(source) as java.util.concurrent.atomic.AtomicInteger).get() > 0
+} ?: false
+
+private fun <T> keiSourceMember(source: Source, get: (Class<*>) -> T): T? =
+    generateSequence<Class<*>>(source.javaClass) { it.superclass }.firstOrNull { it.name == "keiyoushi.source.KeiSource" }
+        ?.let { runCatching { get(it) }.getOrNull() }
+
+private class FilterSpecMiss(message: String) : Exception(message)
+
+/**
+ * The filter list with every --filter applied. A spec that names something the list doesn't have, on a
+ * source that fetches its filters, waits for the fetched filters and applies all specs to those: the
+ * app's sheet shows them once the background fetch is done (or after Reset).
+ */
+private fun buildFilters(source: Source, o: Opts): FilterList {
+    if (o.fetchFilters) waitForFilterData(source)
+    var list = source.getFilterList()
+    val set = try {
+        o.filterSpecs.map { applyFilter(list, it) }
+    } catch (e: FilterSpecMiss) {
+        if (o.fetchFilters || !supportsFilterFetching(source)) die(e.message!!)
+        System.err.println("filters: not in the initial list, waiting for the source's fetched filters (${e.message})")
+        o.fetchFilters = true
+        waitForFilterData(source)
+        list = source.getFilterList()
+        try {
+            o.filterSpecs.map { applyFilter(list, it) }
+        } catch (e: FilterSpecMiss) {
+            die(e.message!!)
+        }
+    }
+    if (set.isNotEmpty()) System.err.println("filters set: " + set.joinToString(" · "))
+    return list
+}
+
+private fun Filter<*>.kind() = generateSequence<Class<*>>(this::class.java) { it.superclass }
+    .firstOrNull { it.enclosingClass == Filter::class.java }?.simpleName ?: "?"
+
+private fun <T> pick(what: String, items: List<T>, name: (T) -> String, want: String): T {
+    items.filter { name(it).trim().equals(want, true) }.singleOrNull()?.let { return it }
+    val hits = items.filter { name(it).contains(want, true) }
+    return hits.singleOrNull() ?: throw FilterSpecMiss(
+        "--filter: ${if (hits.isEmpty()) "no" else "${hits.size} matching"} $what '$want'; " +
+            (if (hits.isEmpty()) items else hits).joinToString(limit = 40) { "\"${name(it).trim()}\"" },
+    )
+}
+
+private fun Filter.Group<*>.items() = state.filterIsInstance<Filter<*>>()
+
+/** Applies one --filter spec to [list] and returns what it set, e.g. `Status=Ongoing (Select #2)`. */
+private fun applyFilter(list: List<Filter<*>>, spec: String): String {
+    val neg = spec.startsWith("!")
+    val body = spec.removePrefix("!")
+    val name = body.substringBefore('=').trim()
+    var value: String? = if ('=' in body) body.substringAfter('=').trim() else null
+    val settable = list.filter { it !is Filter.Header && it !is Filter.Separator }
+    val target: Filter<*> = if ('/' in name) {
+        val group = pick("group", settable.filterIsInstance<Filter.Group<*>>(), { it.name }, name.substringBefore('/').trim())
+        pick("item in \"${group.name}\"", group.items(), { it.name }, name.substringAfter('/').trim())
+    } else {
+        val top = settable.filter { it.name.trim().equals(name, true) }.singleOrNull()
+            ?: settable.filter { it.name.contains(name, true) }.singleOrNull()
+        when {
+            top is Filter.Group<*> && value != null ->
+                pick("item in \"${top.name}\"", top.items(), { it.name }, value).also { value = null }
+            top != null -> top
+            else -> pick("filter or group item", settable.filterIsInstance<Filter.Group<*>>().flatMap { it.items() } + settable, { it.name }, name)
+        }
+    }
+    @Suppress("UNCHECKED_CAST")
+    val f = target as Filter<Any?>
+    fun need() = value ?: die("--filter $spec: ${target.kind()} \"${target.name}\" needs =<value>")
+    when (target) {
+        is Filter.Select<*> -> {
+            val v = need()
+            f.state = if (v.startsWith("#")) v.drop(1).toInt() else target.values.indexOf(pick("option of \"${target.name}\"", target.values.toList(), { it.toString() }, v))
+        }
+        is Filter.Sort -> {
+            val v = need()
+            val asc = v.endsWith(":asc", true)
+            val opt = v.substringBeforeLast(':').takeIf { v.endsWith(":asc", true) || v.endsWith(":desc", true) } ?: v
+            f.state = Filter.Sort.Selection(target.values.indexOf(pick("option of \"${target.name}\"", target.values.toList(), { it }, opt)), asc)
+        }
+        is Filter.Text -> f.state = need()
+        is Filter.CheckBox -> f.state = when (value?.lowercase()) {
+            null -> !neg
+            "true", "on", "yes", "1", "include" -> true
+            "false", "off", "no", "0", "exclude" -> false
+            else -> die("--filter $spec: CheckBox takes true/false")
+        }
+        is Filter.TriState -> f.state = when (value?.lowercase()) {
+            null -> if (neg) Filter.TriState.STATE_EXCLUDE else Filter.TriState.STATE_INCLUDE
+            "include", "true", "on", "1" -> Filter.TriState.STATE_INCLUDE
+            "exclude", "false", "off", "2" -> Filter.TriState.STATE_EXCLUDE
+            "ignore", "0" -> Filter.TriState.STATE_IGNORE
+            else -> die("--filter $spec: TriState takes include/exclude/ignore")
+        }
+        is Filter.Group<*> -> die("--filter $spec: \"${target.name}\" is a Group; use Group=Item or Group/Item")
+        else -> die("--filter $spec: can't set a ${target.kind()}")
+    }
+    val shown = when (target) {
+        is Filter.Select<*> -> "${target.values.getOrNull(target.state)} #${target.state}"
+        is Filter.Sort -> target.state?.let { "${target.values[it.index]} ${if (it.ascending) "asc" else "desc"}" }
+        is Filter.TriState -> when (target.state) { 1 -> "include"; 2 -> "exclude"; else -> "ignore" }
+        else -> target.state.toString()
+    }
+    return "${target.name.trim()}=$shown (${target.kind()})"
+}
+
+private fun stripBase(source: Source, u: String): String {
+    val base = source.base() ?: return u
+    // Only on a boundary: https://site.com must not eat the start of https://site.com.cdn/...
+    val rest = u.removePrefix(base).takeIf { it != u } ?: return u
+    return if (rest.isEmpty() || rest[0] in "/?#") rest.ifEmpty { "/" } else u
+}
+
+// An http(s) URL goes through URL search and keeps the SManga it returns (memo included), as the app does.
+private suspend fun resolveManga(source: Source, arg: String): SManga {
+    if (!arg.startsWith("http://") && !arg.startsWith("https://")) return SManga.create().apply { url = arg }
     val found = source.getSearchManga(1, arg, source.getFilterList()).mangas.firstOrNull()
     if (found != null) {
         System.err.println("resolved $arg -> manga.url=${found.url}")
-        return found.url
+        return found
     }
-    return stripBase(source, arg).also { System.err.println("URL search found nothing; using path $it") }
+    val path = stripBase(source, arg).also { System.err.println("URL search found nothing; using path $it") }
+    return SManga.create().apply { url = path }
 }
 
 // ---------- output ----------
@@ -354,7 +591,10 @@ private fun printManga(o: Opts, m: SManga, chapters: List<SChapter>?) {
     }
 }
 
-private fun printPages(o: Opts, source: Source, pages: List<Page>) {
+/** `pages --images N`: what loading the first N images gave. */
+private class ImageCheck(val images: JsonArray?, val error: String?, val warnings: List<String>)
+
+private fun printPages(o: Opts, source: Source, pages: List<Page>, check: ImageCheck? = null) {
     val noUrl = pages.count { it.imageUrl.isNullOrBlank() && it.url.isBlank() }
     val hosts = pages.mapNotNull { (it.imageUrl ?: it.url).takeIf(String::isNotBlank)?.let { u -> runCatching { java.net.URI(u).host }.getOrNull() } }
         .groupingBy { it }.eachCount()
@@ -373,6 +613,9 @@ private fun printPages(o: Opts, source: Source, pages: List<Page>) {
                     pages.forEach { p -> add(buildJsonObject { put("index", p.index); put("url", p.url); put("imageUrl", p.imageUrl) }) }
                 },
             )
+            check?.images?.let { put("images", it) }
+            check?.error?.let { put("imageError", it) }
+            check?.warnings?.takeIf { it.isNotEmpty() }?.let { w -> put("imageWarnings", JsonArray(w.map(::JsonPrimitive))) }
         },
     ) {
         buildString {
@@ -383,8 +626,23 @@ private fun printPages(o: Opts, source: Source, pages: List<Page>) {
             window(pages, o, head = minOf(o.limit, 5), tail = 3).forEach { e ->
                 if (e == null) appendLine("  ...") else appendLine("%4d. %s".format(e.second.index, e.second.imageUrl ?: "url=" + e.second.url))
             }
+            check?.images?.forEach { appendLine("image: $it") }
+            check?.error?.let { appendLine("IMAGE FAILED: $it") }
+            check?.warnings?.forEach { appendLine("WARN: $it") }
         }.trimEnd()
     }
+}
+
+/** The filter's state when it isn't the default-looking one, for the readable `filters` listing. */
+private fun stateText(f: Filter<*>): String = when (f) {
+    is Filter.Select<*> -> " selected=\"${f.values.getOrNull(f.state)}\""
+    is Filter.Sort -> f.state?.let { " sort=\"${f.values.getOrNull(it.index)}\" ${if (it.ascending) "asc" else "desc"}" } ?: ""
+    is Filter.Text -> if (f.state.isNotEmpty()) " text=\"${f.state}\"" else ""
+    is Filter.CheckBox -> if (f.state) " on" else ""
+    is Filter.TriState -> when (f.state) { 1 -> " include"; 2 -> " exclude"; else -> "" }
+    is Filter.Group<*> -> f.items().filter { stateText(it).isNotEmpty() }.takeIf { it.isNotEmpty() }
+        ?.let { set -> " set=[" + set.joinToString { it.name.trim() + stateText(it) } + "]" } ?: ""
+    else -> ""
 }
 
 private fun printFilters(o: Opts, filters: List<Filter<*>>) {
@@ -405,8 +663,10 @@ private fun printFilters(o: Opts, filters: List<Filter<*>>) {
         filters.joinToString("\n") { f ->
             val d = desc(f)
             "- ${d["type"]!!.toString().trim('"')} ${f::class.java.simpleName} \"${f.name}\"" +
-                ((d["values"] as? JsonArray)?.let { " values=${it.size}" } ?: "") +
-                ((d["items"] as? JsonArray)?.let { " items=${it.size}" } ?: "")
+                ((d["values"] as? JsonArray)?.let { v ->
+                    " values=${v.size} [" + v.take(6).joinToString { it.toString().trim('"') } + (if (v.size > 6) ", ..." else "") + "]"
+                } ?: "") +
+                ((d["items"] as? JsonArray)?.let { " items=${it.size}" } ?: "") + stateText(f)
         }
     }
 }
@@ -592,7 +852,6 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
     var untestable: String? = null
 
     fun finish(): Int {
-        if (WebViewBridge.consumeCfClicked()) warnings += "cloudflare checkbox clicked"
         val ok = steps.isNotEmpty() && steps.none { it.status == "fail" }
         val json = buildJsonObject {
             put("ok", ok)
@@ -602,6 +861,7 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
             put("chapter", chapterUrl)
             untestable?.let { put("untestable", it) }
             put("steps", JsonArray(steps.map { it.toJson() }))
+            Harness.turnstileTicks.get().takeIf { it > 0 }?.let { warnings += "cloudflare checkbox clicked" }
             if (warnings.isNotEmpty()) put("warnings", JsonArray(warnings.map(::JsonPrimitive)))
         }
         println(pretty.encodeToString(JsonElement.serializer(), json))
@@ -682,8 +942,8 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
     val candidates: List<SManga> = when {
         mangaArg != null -> {
             // Keep the listing's title when the given series is in it (the app always has it).
-            val url = try { resolveMangaUrl(source, mangaArg) } catch (e: Exception) { stripBase(source, mangaArg) }
-            listOf(listing?.firstOrNull { safe { it.url } == url } ?: SManga.create().apply { this.url = url })
+            val resolved = try { resolveManga(source, mangaArg) } catch (e: Exception) { SManga.create().apply { url = stripBase(source, mangaArg) } }
+            listOf(listing?.firstOrNull { safe { it.url } == resolved.url } ?: resolved)
         }
         // A different series each run, so repeated runs cover more of the source.
         listing != null -> listing.filter { safe { it.url } != null }.distinctBy { it.url }.shuffled().take(3)
@@ -731,7 +991,18 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
         smokeStep(source, "chapters", steps) { s ->
             var tried = 0
             var lastError: Exception? = null
-            for (listed in (listOfNotNull(opened) + candidates).distinct()) {
+            val first = (listOfNotNull(opened) + candidates).distinct()
+            // A popular list can hold titles the site itself has no chapters for (Comick's 7-day top).
+            // When every one came back empty without an error, titles from Latest get a turn: they're
+            // listed there because a chapter just came out.
+            val fromLatest = if (mangaArg == null && listingName != "latest") {
+                latestMangas.orEmpty().filter { safe { it.url } != null }.distinctBy { it.url }
+                    .filter { l -> first.none { safe { it.url } == l.url } }.shuffled().take(3)
+            } else {
+                emptyList()
+            }
+            for (listed in first + fromLatest) {
+                if (lastError != null && listed in fromLatest) break
                 tried++
                 try {
                     val update = source.getMangaUpdate(listed, emptyList(), false, true)
@@ -739,9 +1010,11 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
                         mangaUrl = listed.url
                         chapters = update.chapters
                         collectChapterWarnings(chapters, warnings)
+                        if (listed in fromLatest) warnings += "${first.size} title(s) from its $listingName list had no chapters"
                         s.detail = buildJsonObject {
                             put("url", listed.url)
                             safe { listed.title }?.let { put("title", it) }
+                            if (listed in fromLatest) put("from", "latest")
                             put("chapterCount", update.chapters.size)
                             put("triedCandidates", tried)
                         }
@@ -832,8 +1105,8 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
     return finish()
 }
 
-/** The first 2 pages' images through source.client, as the reader (HttpPageLoader) loads them; throws on a bad one. */
-private suspend fun loadPageImages(source: Source, pages: List<Page>, warnings: MutableList<String>): JsonArray {
+/** The first [count] pages' images through source.client, as the reader (HttpPageLoader) loads them; throws on a bad one. */
+private suspend fun loadPageImages(source: Source, pages: List<Page>, warnings: MutableList<String>, count: Int = 2): JsonArray {
     val http = source as? HttpSource ?: throw IllegalStateException("source is not an HttpSource; can't exercise imageRequest/interceptors")
     val scrambleHeaderNames = listOf("x-scramble-grid", "x-scramble-seed", "x-scramble-algo", "x-enc-seed", "x-enc-algo")
     val digests = mutableListOf<String>()
@@ -841,11 +1114,16 @@ private suspend fun loadPageImages(source: Source, pages: List<Page>, warnings: 
     val images = buildJsonArray {
         // As the reader (HttpPageLoader): fresh Page objects from the list, getImageUrl() only when
         // imageUrl is null or empty, then HttpSource.getImage() (cacheless client + awaitSuccess).
-        pages.take(2).map { Page(it.index, it.url, it.imageUrl) }.forEach { page ->
+        pages.take(count).map { Page(it.index, it.url, it.imageUrl) }.forEach { page ->
             if (page.imageUrl.isNullOrEmpty()) page.imageUrl = http.getImageUrl(page)
             http.getImage(page).use { response ->
                 val url = response.request.url
                 val bytes = response.body.bytes()
+                // EXT_RUN_SAVE_IMAGES (ext-run.sh --save-images DIR): keep what the reader would get, after the source's interceptors.
+                System.getenv("EXT_RUN_SAVE_IMAGES")?.takeIf { it.isNotEmpty() }?.let { dir ->
+                    val ext = response.body.contentType()?.subtype?.substringBefore('+')?.takeIf { it.matches(Regex("[a-z0-9]{2,5}")) } ?: "bin"
+                    java.io.File(dir).resolve("page${page.index}.$ext").writeBytes(bytes)
+                }
                 check(bytes.size >= 1024) { "body only ${bytes.size} bytes for $url" }
                 digests += sha256(bytes)
                 KNOWN_PLACEHOLDERS[digests.last()]?.let { throw IllegalStateException("$url is $it, not a page") }
@@ -902,12 +1180,12 @@ private suspend fun loadPageImages(source: Source, pages: List<Page>, warnings: 
             }
         }
     }
-    // Two different pages with byte-identical images: a host's placeholder (e.g. imgbox's
-    // "Thumbnail Temporarily Unavailable"), not the chapter.
+    // Byte-identical images on two pages can be a host placeholder or a chapter that repeats a panel
+    // (NovelCool Cherry Blossoms After Winter Ch.150); known placeholders fail above by sha256.
     if (digests.size >= 2 && digests.distinct().size == 1) {
-        throw IllegalStateException("pages ${pages[0].index} and ${pages[1].index} returned the same image (sha256 ${digests[0].take(16)}), a placeholder rather than pages")
+        warnings += "pages ${pages[0].index} and ${pages[1].index} returned the same image (sha256 ${digests[0].take(16)})"
     }
-    check(images.size >= minOf(2, pages.size)) { "only ${images.size}/2 page images downloaded" }
+    check(images.size >= minOf(count, pages.size)) { "only ${images.size}/${minOf(count, pages.size)} page images downloaded" }
     // One blank page happens (chapter separators); every page we loaded being one flat colour is a placeholder.
     if (singleColour > 0 && singleColour == images.size) throw IllegalStateException("page images are a single flat colour, a placeholder rather than pages")
     if (singleColour > 0) warnings += "$singleColour of ${images.size} page images is a single flat colour"

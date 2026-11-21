@@ -18,6 +18,8 @@ import android.webkit.WebViewClient
 import eu.kanade.tachiyomi.network.AndroidCookieJar
 import keiyoushi.extrun.CfClearances
 import keiyoushi.extrun.Harness
+import keiyoushi.extrun.Hold
+import keiyoushi.extrun.WebViewBridge
 import keiyoushi.extrun.MainThread
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -27,6 +29,7 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class CloudflareInterceptor(
     private val context: Context,
@@ -167,7 +170,34 @@ class CloudflareInterceptor(
             webview.loadUrl(origRequestUrl, headers)
         }
 
-        latch.awaitFor30Seconds()
+        // ext-run: once the sidecar has ticked a Turnstile checkbox, this is the app's user solving it in WebView, who
+        // goes back as soon as the page is through, without waiting for onPageFinished (an ad-heavy page's load event can
+        // take minutes). So after a tick a new cf_clearance in the jar is the solve. Untouched solves keep the app's test.
+        val deadline = start + 30_000
+        while (latch.count > 0 && System.currentTimeMillis() < deadline) {
+            latch.await(500, TimeUnit.MILLISECONDS)
+            if (latch.count > 0 && (webview?.turnstileTicks ?: 0) > 0 &&
+                cookieManager.get(originalRequest.url).firstOrNull { it.name == "cf_clearance" }.let { it != null && it != oldCookie }
+            ) {
+                cloudflareBypassed = true
+                latch.countDown()
+            }
+        }
+        // ext-run: --pause holds a challenge still showing after 30s for someone to answer (`ext-run cdp`), as the
+        // app's user would open WebView, instead of failing. A new cf_clearance once resumed is the solve.
+        val held = webview
+        var answered = false
+        if (latch.count > 0 && challengeFound && Hold.pause && held != null) {
+            answered = true
+            Hold.await(Hold.announce(held, "Cloudflare challenge on ${originalRequest.url.host} still showing after 30s"))
+            WebViewBridge.cookiesOf(held)
+            if (cookieManager.get(originalRequest.url).firstOrNull { it.name == "cf_clearance" }.let { it != null && it != oldCookie }) {
+                cloudflareBypassed = true
+                latch.countDown()
+            } else {
+                why = "no new cf_clearance after the hold"
+            }
+        }
 
         executor.execute {
             if (!cloudflareBypassed) {
@@ -184,7 +214,12 @@ class CloudflareInterceptor(
         val secs = (System.currentTimeMillis() - start + 500) / 1000
         if (cloudflareBypassed) {
             CfClearances.solved(originalRequest.url)
-            System.err.println("cloudflare: solved ${originalRequest.url.host} in ${secs}s")
+            val ticked = when {
+                answered -> " (held with --pause and answered by hand: in the app this needs the user, in WebView)"
+                (webview?.turnstileTicks ?: 0) > 0 -> " (checkbox ticked: in the app this needs the user, in WebView)"
+                else -> ""
+            }
+            System.err.println("cloudflare: solved ${originalRequest.url.host} in ${secs}s$ticked")
         }
 
         // Throw exception if we failed to bypass Cloudflare

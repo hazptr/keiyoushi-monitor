@@ -44,7 +44,8 @@ MAX_PER_SHARD = 300
 BLOCKISH = re.compile(
     r"HTTP error (403|429|451|5\d\d)\b|cloudflare|challenge|bypass|turnstile|cf-mitigated|"
     r"timed? ?out|timeout|connect(ion)?(exception| refused| reset)|failed to connect|"
-    r"unknownhost|could not resolve|ssl|handshake|unexpected end of stream|\beof\b",
+    r"unknownhost|could not resolve|name resolution|name or service not known|no address associated|"
+    r"ssl|handshake|unexpected end of stream|\beof\b",
     re.I,
 )
 # Languages spoken in essentially one country, where a site's audience (and any geo rule) is there.

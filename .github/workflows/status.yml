@@ -321,7 +321,9 @@ jobs:
   build-site:
     needs: [selftest, validate-inputs, build, sweep]
     runs-on: ubuntu-latest
-    if: always() && needs.selftest.result == 'success' && needs.build.result == 'success'
+    # A sweep that never ran (e.g. build-runtime failed) has no results; publishing then would
+    # list every source as pending and reset every "since" date.
+    if: always() && needs.selftest.result == 'success' && needs.build.result == 'success' && (needs.sweep.result == 'success' || needs.sweep.result == 'failure')
     permissions:
       contents: read
     steps:

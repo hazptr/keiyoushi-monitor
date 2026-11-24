@@ -865,7 +865,15 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
             if (warnings.isNotEmpty()) put("warnings", JsonArray(warnings.map(::JsonPrimitive)))
         }
         println(pretty.encodeToString(JsonElement.serializer(), json))
-        return if (ok) 0 else 1
+        return if (ok || (untestable != null && steps.isEmpty())) 0 else 1
+    }
+
+    // Self-hosted: the baseUrl is the user's own server (blank or loopback until set); no request goes out.
+    val base = runCatching { source.base() }.getOrNull()
+    val host = base?.toHttpUrlOrNull()?.host
+    if (base?.isBlank() == true || host != null && (host == "localhost" || host.startsWith("127.") || host == "::1")) {
+        untestable = "Self-hosted, needs your own server to test"
+        return finish()
     }
 
     // 1. browse: the Browse tab (getPopularManga).

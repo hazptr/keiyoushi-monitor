@@ -89,7 +89,9 @@ the proxy's country. See [`proxy/README.md`](proxy/README.md) for the rest.
 - `recheck/geo.tsv` — sources that only work from particular countries.
 - `site/` — the static page (`index.html`/`app.js`/`style.css`).
 - `untestable-sources.tsv` — sources that can't be smoke-tested at all (self-hosted software like
-  Komga/LANraragi, Japan-only sites) and the reason shown on the page, instead of a failure.
+  Japan-only sites) and the reason shown on the page, instead of a failure. A source whose baseUrl
+  is blank or loopback (127.x, localhost) until the user sets a server needs no entry: the smoke run
+  sends nothing and marks it self-hosted.
 - `config/<lang>_<name>.toml` — per-source settings: `not_applicable` (operations the source
   doesn't have, such as search on a site without one, shown as not applicable instead of failing),
   `not_applicable_reason`, and `smoke_url` (a title to test, for sources with no lists to pick from).

@@ -37,7 +37,7 @@ except (FileNotFoundError, json.JSONDecodeError):
     sys.exit(0)
 
 if data.get("untestable"):
-    row("untestable", first_failure(data.get("steps", [])) or "untestable")
+    row("untestable", first_failure(data.get("steps", [])) or scrub_text(str(data["untestable"]))[:200])
 elif data.get("ok"):
     row("pass", "")
 else:

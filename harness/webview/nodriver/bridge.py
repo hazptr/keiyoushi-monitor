@@ -178,6 +178,19 @@ class Browser:
         self.on_session_gone = {}  # sessionId -> fn() when Chrome dies
 
     async def start(self):
+        await ensure_display()
+        try:
+            await self.launch()
+        except RuntimeError as e:
+            # Chrome exits at once (1) without an X server: the display died, or another sidecar in this netns held it.
+            if "exited" not in str(e):
+                raise
+            log(f"{e}; display {DISPLAY} {'up' if xvfb_running() else 'down'}, restarting Xvfb and trying once more")
+            self.kill()
+            await ensure_display(restart=True)
+            await self.launch()
+
+    async def launch(self):
         self.dir = tempfile.mkdtemp(prefix="chrome-")
         # A real port, as nodriver does: with --remote-debugging-port=0 Chrome sets navigator.webdriver.
         with socket.socket() as probe:
@@ -233,6 +246,47 @@ class Browser:
                 pass
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
+
+
+DISPLAY = os.environ.get("DISPLAY", ":99")
+xvfb_proc = None
+
+
+def xvfb_running():
+    """Is an Xvfb for our display running in this container (start.sh's, or one we started)."""
+    want = f"Xvfb\0{DISPLAY}\0".encode()
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    if f.read().startswith(want):
+                        return True
+            except OSError:
+                pass
+    return False
+
+
+async def ensure_display(restart=False):
+    """Xvfb up before Chrome starts: start.sh launches it, but nothing restarts it if it dies, and then every Chrome
+    launch exits with 1 while the container looks healthy."""
+    global xvfb_proc
+    if not restart and xvfb_running():
+        return
+    n = DISPLAY.lstrip(":")
+    if restart and xvfb_proc and xvfb_proc.poll() is None:
+        xvfb_proc.kill()
+    for f in (f"/tmp/.X{n}-lock", f"/tmp/.X11-unix/X{n}"):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    log(f"starting Xvfb {DISPLAY}")
+    xvfb_proc = subprocess.Popen(["Xvfb", DISPLAY, "-screen", "0", f"{WINDOW[0]}x{WINDOW[1]}x24", "-nolisten", "tcp", "-noreset"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(50):
+        if os.path.exists(f"/tmp/.X11-unix/X{n}") or xvfb_proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
 
 
 browser_task = None  # asyncio.Task[Browser]
@@ -340,7 +394,14 @@ def bridge_script(url, bridges):
 
 # androidx.webkit features (see the JVM's WebViewGlue) this backend implements.
 FEATURES = ["DOCUMENT_START_SCRIPT:1", "WEB_MESSAGE_LISTENER", "WEB_MESSAGE_ARRAY_BUFFER", "USER_AGENT_METADATA",
-            "COOKIE_INTERCEPT", "MUTE_AUDIO", "MULTI_PROFILE", "CUSTOM_REQUEST_HEADERS"]
+            "COOKIE_INTERCEPT", "MUTE_AUDIO", "MULTI_PROFILE", "CUSTOM_REQUEST_HEADERS", "JS_INJECTION_IN_FRAME_AND_WORLD"]
+
+
+def script_params(src, world):
+    p = {"source": src}
+    if world:
+        p["worldName"] = world
+    return p
 
 
 def origin_allowed(url, rules):
@@ -389,6 +450,15 @@ def start_script_source(source, origins):
     if "*" in origins:
         return source
     return f"if (({ALLOWED_JS})(location.origin, {json.dumps(origins)})) {{\n{source}\n}}"
+
+
+def on_event_source(source, event):
+    """addJavaScriptOnEvent's DOCUMENT_END (1): after the document is parsed. The script runs as a function body
+    there, so its top-level declarations stay local to it (DOCUMENT_START runs it as given)."""
+    if event != 1:
+        return source
+    return ("(() => { const run = () => {\n" + source + "\n}; if (document.readyState === 'loading') "
+            "document.addEventListener('DOMContentLoaded', run, { once: true }); else run(); })();")
 
 
 def listener_script(url, name, origins, evt):
@@ -522,7 +592,8 @@ class View:
         self.target = None
         self.session = None
         self.sessions = set()
-        self.scripts = []      # (key, source) init scripts, applied to every page/iframe session; key None = not removable
+        self.scripts = []      # (key, source, world) init scripts, applied to every page/iframe session; key None = not
+                               # removable; world None = the page's own, else an isolated world of that name
         self.script_ids = {}   # (session, key) -> CDP script identifier, for removal
         self.listeners = {}    # web message listener name -> event name its replies are dispatched as
         self.frame_sid = {}    # frameId -> the session it posted a message from (replies go back there)
@@ -541,6 +612,8 @@ class View:
         self.tick_task = None
         self.ticks = 0  # Turnstile ticks on this view, across watcher restarts (TICK_MAX is per view)
         self.clearance_sent = set()  # cf_clearance (domain, value) pairs already pushed after a tick
+        self.keep_storage = bool(m.get("keepStorage"))  # --cookies FILE: localStorage is kept across runs
+        self.storage = {}      # origin -> {key: value}, the main frame's localStorage at each load
 
 
 class Client:
@@ -588,7 +661,57 @@ class Client:
             self.add_listener(st, listener, apply=False)
         sid = (await b.cdp.send("Target.attachToTarget", {"targetId": st.target, "flatten": True}))["sessionId"]
         st.session = sid
+        if m.get("storage"):
+            await self.seed_storage(st, sid, m["storage"])
         await self.setup_session(st, sid, "page")
+
+    async def seed_storage(self, st, sid, storage):
+        """The kept localStorage (--cookies FILE) into the new context, before anything loads: each origin's items set
+        from a blank document of that origin that the Fetch handler answers itself (nothing reaches the network, the
+        JVM sees no load), then back to about:blank. Page, Network and the view's handlers aren't on yet."""
+        b = st.b
+
+        def on_event(method, p):
+            if method == "Fetch.requestPaused":
+                b.cdp.fire("Fetch.fulfillRequest", fulfil_params(p["requestId"], {
+                    "status": 200, "contentType": "text/html", "body": ""}), sid)
+        b.cdp.handlers[sid] = on_event
+        try:
+            await b.cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*/__ext_run_storage__"}]}, sid)
+            for origin, items in storage.items():
+                if not origin.startswith(("http://", "https://")) or not items:
+                    continue
+                url = origin + "/__ext_run_storage__"
+                await b.cdp.send("Page.navigate", {"url": url}, sid)
+                for _ in range(50):
+                    r = await b.cdp.send("Runtime.evaluate", {"expression": "location.href", "returnByValue": True}, sid)
+                    if r.get("result", {}).get("value") == url:
+                        break
+                    await asyncio.sleep(0.05)
+                ctx = (await b.cdp.send("Page.createIsolatedWorld", {"frameId": st.target, "worldName": "ext-run-storage"}, sid))["executionContextId"]
+                await b.cdp.send("Runtime.evaluate", {
+                    "expression": f"for (const [k, v] of Object.entries({json.dumps(items)})) localStorage.setItem(k, v)",
+                    "contextId": ctx}, sid)
+            await b.cdp.send("Fetch.disable", None, sid)
+            await b.cdp.send("Page.navigate", {"url": "about:blank"}, sid)
+        except CDPError as e:
+            self.send({"ev": "log", "wid": st.wid, "text": f"localStorage not restored: {e}"})
+        finally:
+            b.cdp.handlers.pop(sid, None)
+
+    async def snapshot_storage(self, st):
+        """The main frame's localStorage, read from an isolated world (the page can't see it), into st.storage."""
+        cdp, sid = st.b.cdp, st.session
+        try:
+            ctx = (await cdp.send("Page.createIsolatedWorld", {"frameId": st.target, "worldName": "ext-run-storage"}, sid))["executionContextId"]
+            r = await cdp.send("Runtime.evaluate", {
+                "expression": "JSON.stringify({ o: location.origin, s: Object.fromEntries(Object.entries(localStorage)) })",
+                "contextId": ctx, "returnByValue": True}, sid)
+            v = json.loads(r["result"]["value"])
+            if v["o"].startswith(("http://", "https://")):
+                st.storage[v["o"]] = v["s"]
+        except (CDPError, KeyError, ValueError, TypeError):
+            pass
 
     async def setup_session(self, st, sid, kind):
         b = st.b
@@ -620,8 +743,10 @@ class Client:
             if not st.js:
                 cmds.append(send("Emulation.setScriptExecutionDisabled", {"value": True}))
             keyed = []
-            for key, src in st.scripts:
-                cmds.append(send("Page.addScriptToEvaluateOnNewDocument", {"source": src}))
+            # Injected objects (JS interfaces, web message listeners) exist before any document-start script runs,
+            # as in Chromium, whatever order they were added in.
+            for key, src, world in sorted(st.scripts, key=lambda e: 0 if e[0] is None or e[0][0] == "listener" else 1):
+                cmds.append(send("Page.addScriptToEvaluateOnNewDocument", script_params(src, world)))
                 keyed.append((len(cmds) - 1, key))
         else:
             keyed = []
@@ -637,7 +762,7 @@ class Client:
 
     def add_bridges(self, st, bridges, apply=True):
         src = bridge_script(st.bridge_url, bridges)
-        st.scripts.append((None, src))
+        st.scripts.append((None, src, None))
         if apply:
             for sid in list(st.sessions):
                 st.b.cdp.fire("Page.addScriptToEvaluateOnNewDocument", {"source": src}, sid)
@@ -648,14 +773,14 @@ class Client:
             params["userAgentMetadata"] = st.ua_metadata
         return params
 
-    def add_script(self, st, key, src, apply):
-        st.scripts.append((key, src))
+    def add_script(self, st, key, src, apply, world=None):
+        st.scripts.append((key, src, world))
         if not apply:
             return
 
         async def add(sid):
             try:
-                r = await st.b.cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": src}, sid)
+                r = await st.b.cdp.send("Page.addScriptToEvaluateOnNewDocument", script_params(src, world), sid)
                 st.script_ids[(sid, key)] = r.get("identifier")
             except CDPError:
                 pass
@@ -663,19 +788,42 @@ class Client:
             asyncio.ensure_future(add(sid))
 
     def remove_script(self, st, key):
-        st.scripts = [(k, s) for k, s in st.scripts if k != key]
+        st.scripts = [e for e in st.scripts if e[0] != key]
         for sid in list(st.sessions):
             ident = st.script_ids.pop((sid, key), None)
             if ident:
                 st.b.cdp.fire("Page.removeScriptToEvaluateOnNewDocument", {"identifier": ident}, sid)
 
     def add_start_script(self, st, s, apply=True):
-        self.add_script(st, ("start", s["id"]), start_script_source(s["source"], s.get("origins") or ["*"]), apply)
+        src = start_script_source(on_event_source(s["source"], s.get("event") or 0), s.get("origins") or ["*"])
+        self.add_script(st, ("start", s["id"]), src, apply, s.get("world") or None)
 
     def add_listener(self, st, listener, apply=True):
         name, evt = listener["name"], "ext-run-message-" + secrets.token_hex(6)
         st.listeners[name] = evt
-        self.add_script(st, ("listener", name), listener_script(st.bridge_url, name, listener.get("origins") or ["*"], evt), apply)
+        self.add_script(st, ("listener", name), listener_script(st.bridge_url, name, listener.get("origins") or ["*"], evt),
+                        apply, listener.get("world") or None)
+
+    async def reply_eval(self, st, m):
+        """JsReplyProxy.executeJavaScript: the script in the sending frame, in the listener's world (the main frame's
+        own world without one); its value JSON-encoded, None when it threw. A subframe's main world isn't reachable
+        without Runtime.enable, so there it fails."""
+        frame = m["frameId"]
+        sid = st.frame_sid.get(frame, st.session)
+        cdp = st.b.cdp
+        params = {"expression": m["script"], "returnByValue": True, "awaitPromise": False}
+        if m.get("world"):
+            params["contextId"] = (await cdp.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": m["world"]}, sid))["executionContextId"]
+        elif frame != st.target:
+            return None
+        try:
+            r = await cdp.send("Runtime.evaluate", params, sid)
+        except CDPError:
+            return None
+        if r.get("exceptionDetails"):
+            return None
+        v = r.get("result", {})
+        return "null" if "value" not in v else json.dumps(v["value"], ensure_ascii=False)
 
     async def post_reply(self, st, m):
         evt = st.listeners.get(m["name"])
@@ -780,6 +928,8 @@ class Client:
             debug(f"child {kind} setup failed: {e}")
 
     async def page_finished(self, st, url):
+        if st.keep_storage:
+            asyncio.ensure_future(self.snapshot_storage(st))
         try:
             cookies = (await st.b.cdp.send("Storage.getCookies", {"browserContextId": st.ctx}))["cookies"]
             self.send({"ev": "cookies", "wid": st.wid, "cookies": [proto_cookie(c) for c in cookies]})
@@ -1148,6 +1298,22 @@ class Client:
         if op == "postReply":
             await self.post_reply(st, m)
             return None
+        if op == "replyEval":
+            return await self.reply_eval(st, m)
+        if op == "touch":
+            # View.dispatchTouchEvent: real touch input (isTrusted), in CSS pixels.
+            await cdp.send("Input.dispatchTouchEvent", {"type": m["type"], "touchPoints": m.get("points") or []}, sid)
+            return None
+        if op == "frame":
+            # postVisualStateCallback: answered after the page's next animation frame (2 s at most).
+            try:
+                frame = (await cdp.send("Page.getFrameTree", None, sid))["frameTree"]["frame"]["id"]
+                ctx = (await cdp.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "ext-run-frame"}, sid))["executionContextId"]
+                await asyncio.wait_for(cdp.send("Runtime.evaluate", {
+                    "expression": "new Promise(r => requestAnimationFrame(() => r(1)))", "awaitPromise": True, "contextId": ctx}, sid), 2)
+            except (CDPError, asyncio.TimeoutError):
+                pass
+            return None
         if op == "load":
             if m["url"] == "about:blank":
                 st.blank_requested = True
@@ -1176,6 +1342,9 @@ class Client:
             except CDPError:
                 pass
             return None
+        if op == "storage":
+            await self.snapshot_storage(st)
+            return st.storage
         if op == "cookies":
             return [proto_cookie(c) for c in (await cdp.send("Storage.getCookies", {"browserContextId": st.ctx}))["cookies"]]
         if op == "setCookies":

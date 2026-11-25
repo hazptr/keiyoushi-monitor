@@ -61,6 +61,7 @@ object WebViewBridge {
     private val io = Executors.newCachedThreadPool { Thread(it, "ext-run-webview-io").apply { isDaemon = true } }
     private val javaBridge = Executors.newSingleThreadExecutor { Thread(it, "JavaBridge").apply { isDaemon = true } }
     private var channel: SocketChannel? = null
+    private val androidUaWarned = java.util.concurrent.atomic.AtomicBoolean()
     private var userAgent: String? = null
 
     fun register(view: WebView): Int = nextView.getAndIncrement().also { views[it] = view }
@@ -164,21 +165,24 @@ object WebViewBridge {
         put("wow64", map["WOW64"] as? Boolean ?: false)
     }
 
-    private fun startScriptJson(id: Int, script: String, rules: List<String>) = buildJsonObject {
+    private fun startScriptJson(id: Int, s: WebView.StartScript) = buildJsonObject {
         put("id", id)
-        put("source", script)
-        putJsonArray("origins") { rules.forEach { add(JsonPrimitive(it)) } }
+        put("source", s.source)
+        putJsonArray("origins") { s.rules.forEach { add(JsonPrimitive(it)) } }
+        if (s.world.isNotEmpty()) put("world", s.world)
+        if (s.event != 0) put("event", s.event)
     }
 
-    private fun listenerJson(name: String, rules: List<String>) = buildJsonObject {
+    private fun listenerJson(name: String, rules: List<String>, world: String) = buildJsonObject {
         put("name", name)
         putJsonArray("origins") { rules.forEach { add(JsonPrimitive(it)) } }
+        if (world.isNotEmpty()) put("world", world)
     }
 
-    fun addStartScript(view: WebView, id: Int, script: String, rules: List<String>) = send(buildJsonObject {
+    internal fun addStartScript(view: WebView, id: Int, s: WebView.StartScript) = send(buildJsonObject {
         put("op", "addStartScript")
         put("wid", view.id)
-        put("script", startScriptJson(id, script, rules))
+        put("script", startScriptJson(id, s))
     })
 
     fun removeStartScript(view: WebView, id: Int) = send(buildJsonObject {
@@ -187,10 +191,10 @@ object WebViewBridge {
         put("id", id)
     })
 
-    fun addMessageListener(view: WebView, name: String, rules: List<String>) = send(buildJsonObject {
+    fun addMessageListener(view: WebView, name: String, rules: List<String>, world: String) = send(buildJsonObject {
         put("op", "addMessageListener")
         put("wid", view.id)
-        put("listener", listenerJson(name, rules))
+        put("listener", listenerJson(name, rules, world))
     })
 
     fun removeMessageListener(view: WebView, name: String) = send(buildJsonObject {
@@ -198,6 +202,20 @@ object WebViewBridge {
         put("wid", view.id)
         put("name", name)
     })
+
+    /**
+     * JsReplyProxy.executeJavaScript: [script] in the sending frame, in the listener's world; [done] gets the result
+     * JSON-encoded, or null when it threw or the frame is gone.
+     */
+    fun replyEval(view: WebView, frameId: String, world: String, script: String, done: (String?) -> Unit) {
+        requestAsync(buildJsonObject {
+            put("op", "replyEval")
+            put("wid", view.id)
+            put("frameId", frameId)
+            put("world", world)
+            put("script", script)
+        }).whenComplete { v, _ -> done((v as? JsonPrimitive)?.contentOrNull) }
+    }
 
     fun postReply(view: WebView, frameId: String, name: String, data: String, arrayBuffer: Boolean) {
         if (view.destroyed) return
@@ -245,6 +263,58 @@ object WebViewBridge {
         }
     }
 
+    /**
+     * View.dispatchTouchEvent: the event's pointers in CSS pixels (view pixels over the display density, the inverse of
+     * what a source multiplies by), fingertip size and pressure, as one CDP touch event in the page.
+     */
+    fun touch(view: WebView, e: android.view.MotionEvent) {
+        val density = android.content.res.Resources.getSystem().getDisplayMetrics().density
+        val type = when (e.getActionMasked()) {
+            android.view.MotionEvent.ACTION_DOWN, android.view.MotionEvent.ACTION_POINTER_DOWN -> "touchStart"
+            android.view.MotionEvent.ACTION_MOVE -> "touchMove"
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_POINTER_UP -> "touchEnd"
+            android.view.MotionEvent.ACTION_CANCEL -> "touchCancel"
+            else -> return
+        }
+        // touchEnd lists the pointers still down: none after the last finger (ACTION_UP), the others after a POINTER_UP.
+        val lifted = when (e.getActionMasked()) {
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> (0 until e.getPointerCount()).toSet()
+            android.view.MotionEvent.ACTION_POINTER_UP -> setOf(e.getActionIndex())
+            else -> emptySet()
+        }
+        send(buildJsonObject {
+            put("op", "touch")
+            put("wid", view.id)
+            put("type", type)
+            putJsonArray("points") {
+                for (i in 0 until e.getPointerCount()) {
+                    if (i in lifted) continue
+                    add(buildJsonObject {
+                        put("x", e.getX(i) / density)
+                        put("y", e.getY(i) / density)
+                        put("radiusX", e.getTouchMajor(i) / 2 / density)
+                        put("radiusY", e.getTouchMinor(i) / 2 / density)
+                        put("force", e.getPressure(i))
+                        put("rotationAngle", Math.toDegrees(e.getOrientation(i).toDouble()))
+                        put("id", e.getPointerId(i))
+                    })
+                }
+            }
+        })
+    }
+
+    /** postVisualStateCallback: onComplete on the main thread after the page's next frame (or at once if it has none). */
+    fun visualState(view: WebView, requestId: Long, callback: WebView.VisualStateCallback) {
+        if (!view.opened || channel == null) {
+            MainThread.post { callback.onComplete(requestId) }
+            return
+        }
+        requestAsync(buildJsonObject {
+            put("op", "frame")
+            put("wid", view.id)
+        }).whenComplete { _, _ -> if (!view.destroyed) MainThread.post { callback.onComplete(requestId) } }
+    }
+
     fun stop(view: WebView) = send(buildJsonObject {
         put("op", "stop")
         put("wid", view.id)
@@ -275,6 +345,7 @@ object WebViewBridge {
     fun destroy(view: WebView) {
         views.remove(view.id)
         if (!view.opened || channel == null) return
+        storageOf(view)
         val cookies = try {
             requestAsync(buildJsonObject {
                 put("op", "close")
@@ -300,6 +371,23 @@ object WebViewBridge {
             (cookies as? JsonArray)?.let(::saveCookies)
         }
     }
+
+    /** The view's localStorage per origin into [WebStorage] (kept with --cookies FILE). */
+    private fun storageOf(view: WebView) {
+        if (!WebStorage.enabled) return
+        val byOrigin = try {
+            requestAsync(buildJsonObject {
+                put("op", "storage")
+                put("wid", view.id)
+            }).get(3, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            null
+        }
+        (byOrigin as? JsonObject)?.let(WebStorage::merge)
+    }
+
+    /** At exit: the localStorage of views still open. */
+    fun pullStorage() = openViews().forEach(::storageOf)
 
     /** CookieManager writes reach live pages at once. */
     fun pushCookie(cookie: Cookie) {
@@ -374,7 +462,15 @@ object WebViewBridge {
             // phone that matches the engine; here the engine is desktop Chrome, and desktop Chrome claiming Android
             // fails Cloudflare's managed check (measured 2026-10-10, README "Parity with the app"). So the app's default
             // UA becomes the browser's own; any other UA a source sets is used as given.
-            put("userAgent", s.userAgentOverride()?.takeUnless { it == Harness.userAgent })
+            val ua = s.userAgentOverride()?.takeUnless { it == Harness.userAgent }
+            if (ua != null && "Android" in ua && androidUaWarned.compareAndSet(false, true)) {
+                System.err.println(
+                    "  ! webview: a WebView sets an Android User-Agent, but the sidecar is desktop Chrome (platform hints, " +
+                        "screen, touch, fingerprint): what it solves or earns (Turnstile tokens, challenge cookies) isn't " +
+                        "what the phone would get; check token acceptance on the device",
+                )
+            }
+            put("userAgent", ua)
             put("javaScriptEnabled", s.javaScriptEnabled)
             put("tick", Harness.tick)
             put("blockImages", s.blockNetworkImage || !s.loadsImagesAutomatically)
@@ -388,11 +484,15 @@ object WebViewBridge {
                 val now = System.currentTimeMillis()
                 HarnessCookieJar.all().filter { it.expiresAt > now }.forEach { add(cookieJson(it)) }
             }
-            putJsonArray("startScripts") { view.startScripts.forEach { (id, v) -> add(startScriptJson(id, v.first, v.second)) } }
-            putJsonArray("messageListeners") { view.messageListeners.forEach { (n, v) -> add(listenerJson(n, v.first)) } }
+            putJsonArray("startScripts") { view.startScripts.forEach { (id, v) -> add(startScriptJson(id, v)) } }
+            putJsonArray("messageListeners") { view.messageListeners.forEach { (n, v) -> add(listenerJson(n, v.rules, v.world)) } }
             s.userAgentMetadataOverride()?.let { put("uaMetadata", uaMetadataJson(it)) }
             put("includeCookies", s.includeCookiesOnIntercept)
             put("originHeaders", originHeadersJson())
+            if (WebStorage.enabled) {
+                put("keepStorage", true)
+                WebStorage.snapshot().takeIf { it.isNotEmpty() }?.let { put("storage", it) }
+            }
         })
     }
 
@@ -551,12 +651,12 @@ object WebViewBridge {
             // <jsObjectName>.postMessage from a page (WebViewCompat.addWebMessageListener): main thread, as on Android.
             "message" -> {
                 val name = m.str("name").orEmpty()
-                val listener = view.messageListeners[name]?.second ?: return
+                val listener = view.messageListeners[name] ?: return
                 MainThread.post {
                     if (view.destroyed) return@post
                     try {
                         WebViewGlue.deliver(
-                            view, listener, name, m.str("data").orEmpty(),
+                            view, listener.handler, name, listener.world, m.str("data").orEmpty(),
                             arrayBuffer = m["arrayBuffer"]?.jsonPrimitive?.booleanOrNull == true,
                             origin = m.str("origin") ?: "null",
                             isMainFrame = m["isMainFrame"]?.jsonPrimitive?.booleanOrNull == true,

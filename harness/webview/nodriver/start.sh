@@ -5,5 +5,5 @@
 d=${EXT_RUN_WV_DISPLAY:-99}
 export DISPLAY=:$d
 rm -f /tmp/.X$d-lock /tmp/.X11-unix/X$d
-Xvfb :$d -screen 0 1366x900x24 -nolisten tcp >/dev/null 2>&1 &
+Xvfb :$d -screen 0 1366x900x24 -nolisten tcp -noreset >/dev/null 2>&1 &
 exec python3 -u /bridge/bridge.py "$@"

@@ -34,15 +34,25 @@ open class WebView @JvmOverloads constructor(
 
     // androidx.webkit features (keiyoushi.extrun.WebViewGlue): kept here, sent when the page opens or at once if open.
     internal var audioMuted = false
-    internal val startScripts = ConcurrentSkipListMap<Int, Pair<String, List<String>>>()
+    /** A document script: addDocumentStartJavaScript ([world] "", [event] 0), or addJavaScriptOnEvent. */
+    internal class StartScript(val source: String, val rules: List<String>, val world: String, val event: Int)
+
+    /** A web message listener, in the main world ("") or an isolated one. */
+    internal class Listener(val rules: List<String>, val handler: InvocationHandler, val world: String)
+
+    internal val startScripts = ConcurrentSkipListMap<Int, StartScript>()
     private var nextScript = 1
-    internal val messageListeners = ConcurrentHashMap<String, Pair<List<String>, InvocationHandler>>()
+    internal val messageListeners = ConcurrentHashMap<String, Listener>()
+
+    /** getJavaScriptWorld: named worlds, ids from 1 (0 is the page's own). */
+    internal val worlds = ConcurrentHashMap<String, Int>()
 
     @Synchronized
-    internal fun addStartScript(script: String, rules: List<String>): Int {
+    internal fun addStartScript(script: String, rules: List<String>, world: String = "", event: Int = 0): Int {
         val id = nextScript++
-        startScripts[id] = script to rules
-        if (opened) WebViewBridge.addStartScript(this, id, script, rules)
+        val s = StartScript(script, rules, world, event)
+        startScripts[id] = s
+        if (opened) WebViewBridge.addStartScript(this, id, s)
         return id
     }
 
@@ -50,10 +60,10 @@ open class WebView @JvmOverloads constructor(
         if (startScripts.remove(id) != null && opened) WebViewBridge.removeStartScript(this, id)
     }
 
-    internal fun addMessageListener(name: String, rules: List<String>, listener: InvocationHandler) {
+    internal fun addMessageListener(name: String, rules: List<String>, listener: InvocationHandler, world: String = "") {
         // Chromium: "jsObjectName ... was already added."
-        require(messageListeners.putIfAbsent(name, rules to listener) == null) { "jsObjectName $name was already added." }
-        if (opened) WebViewBridge.addMessageListener(this, name, rules)
+        require(messageListeners.putIfAbsent(name, Listener(rules, listener, world)) == null) { "jsObjectName $name was already added." }
+        if (opened) WebViewBridge.addMessageListener(this, name, rules, world)
     }
 
     internal fun removeMessageListener(name: String) {
@@ -117,6 +127,23 @@ open class WebView @JvmOverloads constructor(
         if (destroyed) return
         destroyed = true
         WebViewBridge.destroy(this)
+    }
+
+    /** Touch input for the page, as a finger on the screen: CDP touch events in the sidecar, in CSS pixels. */
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        if (destroyed || !opened) return false
+        WebViewBridge.touch(this, event)
+        return true
+    }
+
+    /** [callback] gets onComplete once the page has drawn a frame showing its current DOM (a frame in the sidecar). */
+    open fun postVisualStateCallback(requestId: Long, callback: VisualStateCallback) {
+        if (destroyed) return
+        WebViewBridge.visualState(this, requestId, callback)
+    }
+
+    abstract class VisualStateCallback {
+        abstract fun onComplete(requestId: Long)
     }
 
     // View methods (post, layout, parent ...) come from android.view.View.

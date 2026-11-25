@@ -1,6 +1,6 @@
 package android.graphics
 
-open class Rect @JvmOverloads constructor(var left: Int = 0, var top: Int = 0, var right: Int = 0, var bottom: Int = 0) {
+open class Rect @JvmOverloads constructor(@JvmField var left: Int = 0, @JvmField var top: Int = 0, @JvmField var right: Int = 0, @JvmField var bottom: Int = 0) {
     constructor(r: Rect) : this(r.left, r.top, r.right, r.bottom)
 
     fun width() = right - left

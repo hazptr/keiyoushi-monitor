@@ -29,6 +29,11 @@ open class View @JvmOverloads constructor(
     private val handler by lazy { Handler(Looper.getMainLooper()) }
 
     fun getContext(): Context? = mContext
+    open fun getResources(): android.content.res.Resources = mContext?.getResources() ?: android.content.res.Resources.getSystem()
+
+    /** Nothing to touch in a plain View; a WebView sends it to its page. */
+    open fun dispatchTouchEvent(event: MotionEvent): Boolean = false
+    open fun onTouchEvent(event: MotionEvent): Boolean = false
     open fun getParent(): ViewParent? = mParent
 
     open fun getLayoutParams(): ViewGroup.LayoutParams? = layoutParams

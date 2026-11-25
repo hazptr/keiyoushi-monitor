@@ -172,6 +172,72 @@ object FixtureServer {
             .build()
     }
 
+    /** A WebSocket (or other protocol) upgrade: the connection becomes the site's own after the 101. */
+    private fun Wire.isUpgrade() = headers.any { it.first.equals("Upgrade", ignoreCase = true) } &&
+        headers.any { it.first.equals("Connection", ignoreCase = true) && it.second.contains("upgrade", ignoreCase = true) }
+
+    /**
+     * An upgrade request goes to the site as sent, and from then on bytes pass both ways untouched: neither replayed
+     * nor recorded (a frame stream isn't a fixture), so the source's WebSocket works in a recording run as in the
+     * app. Offline it fails like a miss (a 504 the app's WebSocket reports as a failed handshake).
+     */
+    private fun tunnel(w: Wire, ins: InputStream, out: OutputStream) {
+        val label = "${w.method} ${w.url}"
+        if (Harness.offline) {
+            misses.incrementAndGet()
+            note(w, Exchange("miss", missPath = "(a WebSocket upgrade: --offline has no network, and frames aren't recorded)"))
+            write(out, w, Reply(504, "", listOf("Content-Type" to "text/plain"), "ext-run --offline: no network for a WebSocket upgrade\n".toByteArray()))
+            out.flush()
+            return
+        }
+        if (refusePlaceholder(w)) return
+        upstream.incrementAndGet()
+        note(w, Exchange("ws"))
+        val port = w.url.port
+        val up: Socket = try {
+            if (w.url.isHttps) {
+                (javax.net.ssl.SSLSocketFactory.getDefault().createSocket(w.url.host, port) as SSLSocket).apply {
+                    sslParameters = sslParameters.apply { applicationProtocols = arrayOf("http/1.1") }
+                    startHandshake()
+                }
+            } else {
+                Socket(w.url.host, port)
+            }
+        } catch (e: IOException) {
+            System.err.println("  ! upstream $label failed: ${e::class.simpleName}")
+            failures[key(w.method, w.url.toString())] = e
+            return
+        }
+        up.use {
+            val head = StringBuilder("${w.method} ${w.url.encodedPath}${w.url.encodedQuery?.let { "?$it" } ?: ""} HTTP/1.1\r\n")
+            w.headers.forEach { (k, v) -> head.append(k).append(": ").append(v).append("\r\n") }
+            head.append("\r\n")
+            val upOut = up.getOutputStream()
+            upOut.write(head.toString().toByteArray(Charsets.UTF_8))
+            w.body?.let { upOut.write(it) }
+            upOut.flush()
+            val down = thread(isDaemon = true, name = "ext-run-fixture-ws") {
+                try {
+                    up.getInputStream().copyTo(out.let { o -> FlushingStream(o) })
+                } catch (_: IOException) {
+                }
+                runCatching { out.flush() }
+            }
+            try {
+                ins.copyTo(FlushingStream(upOut))
+            } catch (_: IOException) {
+            }
+            runCatching { up.shutdownOutput() }
+            down.join(5_000)
+        }
+    }
+
+    /** Flushes after every write, so frames go through at once. */
+    private class FlushingStream(private val o: OutputStream) : OutputStream() {
+        override fun write(b: Int) { o.write(b); o.flush() }
+        override fun write(b: ByteArray, off: Int, len: Int) { o.write(b, off, len); o.flush() }
+    }
+
     /** A response as it goes on the wire: status, headers in order, body bytes as sent (still encoded). */
     class Reply(val code: Int, val message: String, val headers: List<Pair<String, String>>, val body: ByteArray)
 
@@ -210,6 +276,11 @@ object FixtureServer {
                     val out = BufferedOutputStream(sock.getOutputStream())
                     while (true) {
                         val w = readRequest(ins, out, tls, sni) ?: break
+                        if (w.isUpgrade()) {
+                            raw.soTimeout = 0 // a WebSocket may sit idle for long
+                            tunnel(w, ins, out)
+                            break
+                        }
                         val reply = respond(w) ?: break // null: upstream failed; closing makes the app's call fail
                         write(out, w, reply)
                         out.flush()
@@ -328,6 +399,9 @@ object FixtureServer {
                 // Recording: a fixture holding a Cloudflare challenge is fetched again, so the retry after the
                 // WebView solved it records the page instead of replaying the challenge.
                 ?.takeUnless { !Harness.offline && Transport.isChallenge(it) }
+                // With the network, a body that carries a placeholder (a scrubbed token or cookie value the source
+                // reads and sends back) is fetched again: replayed, the placeholder would go to the site.
+                ?.takeUnless { !Harness.offline && Secrets.carriesRedaction(String(it.readBytes(), Charsets.ISO_8859_1)) }
             // Offline, a repeat beyond what was recorded gets the last recording (fixtures from before
             // repeats were recorded hold one response per request).
             ?: fixture?.takeIf { Harness.offline }?.let(::lastRecorded)
@@ -403,7 +477,24 @@ object FixtureServer {
             .build()
     }
 
+    /** Where a request about to go to the site carries a redacted placeholder, or null. */
+    private fun placeholderIn(w: Wire): String? = when {
+        Secrets.carriesRedaction(w.url.toString()) -> "its URL"
+        else -> w.headers.firstOrNull { (_, v) -> Secrets.carriesRedaction(v) }?.let { "its ${it.first} header" }
+            ?: w.body?.takeIf { Secrets.carriesRedaction(String(it, Charsets.ISO_8859_1)) }?.let { "its body" }
+    }
+
+    /** Fails the request instead of sending a placeholder to the site (it came from a replayed fixture). */
+    private fun refusePlaceholder(w: Wire): Boolean {
+        val where = placeholderIn(w) ?: return false
+        System.err.println("  ! ext-run: ${w.method} ${w.url} not sent: a redacted fixture placeholder would go to the site in $where")
+        failures[key(w.method, w.url.toString())] =
+            IOException("ext-run: a redacted fixture placeholder would go to the site in $where (a value the source took from a replayed response; use a fresh --fixtures dir)")
+        return true
+    }
+
     private fun forward(w: Wire): Reply? {
+        if (refusePlaceholder(w)) return null
         // The request carries the app's Accept-Encoding, so this client's BridgeInterceptor neither adds its own
         // nor decodes: the body comes back as the site sent it. Cookie, User-Agent and Host pass through as given.
         val headers = Headers.Builder().apply {

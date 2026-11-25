@@ -246,6 +246,66 @@ object HarnessCookieJar : CookieJar {
 }
 
 /**
+ * The WebView profile's localStorage, kept across runs next to the cookie jar (EXT_RUN_COOKIES=<file>: in
+ * <file>.storage.json), as the app's WebView keeps it: a login a site stores there (a token) survives into the next
+ * run, like its cookies. Per origin; a view's snapshot of an origin (taken at each page load and when it closes)
+ * replaces what was kept for it. Every new WebView starts with it.
+ */
+object WebStorage {
+    private val file = System.getenv("EXT_RUN_COOKIES")?.takeIf { it.isNotEmpty() }?.let { File("$it.storage.json") }
+    val enabled get() = file != null
+    private val origins = ConcurrentHashMap<String, kotlinx.serialization.json.JsonObject>()
+    private val changed = ConcurrentHashMap.newKeySet<String>()
+
+    fun snapshot(): kotlinx.serialization.json.JsonObject = kotlinx.serialization.json.JsonObject(origins.toMap())
+
+    /** A view's localStorage per origin, as the sidecar read it. */
+    fun merge(byOrigin: kotlinx.serialization.json.JsonObject) {
+        byOrigin.forEach { (origin, items) ->
+            val o = items as? kotlinx.serialization.json.JsonObject ?: return@forEach
+            if (origins[origin] != o) {
+                origins[origin] = o
+                changed += origin
+            }
+        }
+    }
+
+    fun load() {
+        val f = file ?: return
+        if (!f.exists()) return
+        val kept = read(f)
+        kept.forEach { (k, v) -> origins.putIfAbsent(k, v) }
+        if (kept.isNotEmpty()) System.err.println("ext-run: localStorage of ${kept.size} origin(s) from ${f.name} (kept across runs)")
+    }
+
+    /** Writes back the file's origins with this run's changed ones replaced, under the cookie file's lock. */
+    fun save() {
+        val f = file ?: return
+        if (changed.isEmpty()) return
+        try {
+            RandomAccessFile(File(f.path.removeSuffix(".storage.json") + ".lock"), "rw").channel.use { ch ->
+                ch.lock().use {
+                    val merged = LinkedHashMap(if (f.exists()) read(f) else emptyMap())
+                    changed.forEach { o -> origins[o]?.let { merged[o] = it } }
+                    val tmp = File(f.path + ".tmp")
+                    tmp.writeText(kotlinx.serialization.json.JsonObject(merged).toString())
+                    Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("ext-run: couldn't keep localStorage in $f: $e")
+        }
+    }
+
+    private fun read(f: File): Map<String, kotlinx.serialization.json.JsonObject> = try {
+        Json.parseToJsonElement(f.readText()).jsonObject.mapNotNull { (k, v) -> (v as? kotlinx.serialization.json.JsonObject)?.let { k to it } }.toMap()
+    } catch (e: Exception) {
+        System.err.println("ext-run: ignoring unreadable localStorage file $f: $e")
+        emptyMap()
+    }
+}
+
+/**
  * One --map answer: [file] is a body (with an optional `<file>.meta` as fixtures have) or a whole raw HTTP
  * response (`HTTP/1.1 403 Forbidden`, headers, blank line, body bytes); [code] overrides its status.
  */

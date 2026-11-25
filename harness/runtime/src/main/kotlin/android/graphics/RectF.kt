@@ -1,6 +1,6 @@
 package android.graphics
 
-class RectF @JvmOverloads constructor(var left: Float = 0f, var top: Float = 0f, var right: Float = 0f, var bottom: Float = 0f) {
+class RectF @JvmOverloads constructor(@JvmField var left: Float = 0f, @JvmField var top: Float = 0f, @JvmField var right: Float = 0f, @JvmField var bottom: Float = 0f) {
     constructor(r: RectF) : this(r.left, r.top, r.right, r.bottom)
     constructor(r: Rect) : this(r.left.toFloat(), r.top.toFloat(), r.right.toFloat(), r.bottom.toFloat())
 

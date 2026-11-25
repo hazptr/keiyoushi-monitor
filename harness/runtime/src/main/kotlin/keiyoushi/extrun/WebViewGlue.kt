@@ -18,8 +18,8 @@ import java.util.Base64
  * implements them, Playwright none, so there callers take the same fallback as on a WebView without them.
  * MULTI_PROFILE + CUSTOM_REQUEST_HEADERS: getProfile() is the one default profile; its origin-matched headers go
  * to the sidecar, which sets them on matching live requests.
- * Not implemented: JS_INJECTION_IN_FRAME_AND_WORLD (Chromium 146+), so getJavaScriptWorld/addJavaScriptOnEvent
- * and WebMessageReplyProxy.evaluateJs are unavailable, as on any WebView older than that.
+ * JS_INJECTION_IN_FRAME_AND_WORLD (Chromium 146+): named isolated worlds (getJavaScriptWorld), scripts on document
+ * start or end in a world (addJavaScriptOnEvent), web message listeners in a world, and JsReplyProxy.executeJavaScript.
  */
 object WebViewGlue {
     /** The features this file implements; the sidecar's list is intersected with it. */
@@ -32,6 +32,7 @@ object WebViewGlue {
         "MUTE_AUDIO",
         "MULTI_PROFILE",
         "CUSTOM_REQUEST_HEADERS",
+        "JS_INJECTION_IN_FRAME_AND_WORLD",
     )
 
     fun features(): Array<String> = WebViewBridge.features().filter { it in IMPLEMENTED }.toTypedArray()
@@ -61,14 +62,34 @@ object WebViewGlue {
                 }
             }
             "addWebMessageListener" -> {
-                view.addMessageListener(args[0] as String, rules(args[1]), args[2] as InvocationHandler)
+                val world = (args.getOrNull(3) as String?).orEmpty()
+                requireWorld(view, world)
+                view.addMessageListener(args[0] as String, rules(args[1]), args[2] as InvocationHandler, world)
                 null
+            }
+            // Chromium: a world is registered by name once; the same name gives the same world.
+            "getJavaScriptWorld" -> (args[0] as String).let { name ->
+                if (name.isEmpty()) 0 else view.worlds.computeIfAbsent(name) { view.worlds.size + 1 }
+            }
+            "addJavaScriptOnEvent" -> {
+                val world = args[3] as String
+                requireWorld(view, world)
+                val event = args[2] as Int
+                require(event == 0 || event == 1) { "Unknown injection event $event" }
+                val id = view.addStartScript(args[0] as String, rules(args[1]), world, event)
+                handler("ScriptHandler") { n, _ ->
+                    if (n == "remove") view.removeStartScript(id) else unsupported("ScriptHandler", n)
+                    null
+                }
             }
             "removeWebMessageListener" -> { view.removeMessageListener(args[0] as String); null }
             "getProfile" -> profile
             else -> unsupported("WebViewProvider", name)
         }
     }
+
+    private fun requireWorld(view: WebView, world: String) =
+        require(world.isEmpty() || view.worlds.containsKey(world)) { "JavaScript world $world was not registered (getJavaScriptWorld)" }
 
     // ---- ProfileBoundaryInterface: the default profile, shared by every WebView (as in the app) ----
 
@@ -130,7 +151,7 @@ object WebViewGlue {
     // ---- web messages: the page called <jsObjectName>.postMessage(data) ----
 
     /** Calls the extension's WebMessageListener (on the main thread, as Android does). */
-    fun deliver(view: WebView, listener: InvocationHandler, name: String, data: String, arrayBuffer: Boolean, origin: String, isMainFrame: Boolean, frameId: String) {
+    fun deliver(view: WebView, listener: InvocationHandler, name: String, world: String, data: String, arrayBuffer: Boolean, origin: String, isMainFrame: Boolean, frameId: String) {
         val payload = handler("WebMessagePayload") { n, _ ->
             when (n) {
                 "getType" -> if (arrayBuffer) 1 else 0
@@ -161,6 +182,19 @@ object WebViewGlue {
                         WebViewBridge.postReply(view, frameId, name, Base64.getEncoder().encodeToString(bytes), true)
                     } else {
                         WebViewBridge.postReply(view, frameId, name, p.invoke(null, method("getAsString"), null) as String, false)
+                    }
+                    null
+                }
+                "executeJavaScript" -> {
+                    val callback = args[1] as InvocationHandler
+                    WebViewBridge.replyEval(view, frameId, world, args[0] as String) { result ->
+                        keiyoushi.extrun.MainThread.post {
+                            if (result != null) {
+                                callback.invoke(null, method("onSuccess"), arrayOf(result))
+                            } else {
+                                callback.invoke(null, method("onFailure"), arrayOf<Any?>(null))
+                            }
+                        }
                     }
                     null
                 }
@@ -204,6 +238,8 @@ object WebViewGlue {
         fun getType(): Int
         fun getAsString(): String?
         fun getAsArrayBuffer(): ByteArray?
+        fun onSuccess(result: String?)
+        fun onFailure(error: Any?)
     }
 
     private fun method(name: String): Method = Names::class.java.methods.first { it.name == name }

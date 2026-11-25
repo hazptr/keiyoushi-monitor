@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.network.await
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -40,14 +41,24 @@ commands:
   search <query> [page]       getSearchManga with the source's filters (defaults, or as set with --filter;
                                '' as query browses with filters, like the app's filter sheet)
   url <http-url> [page]       getSearchManga(query = url): KeiSource URL-search / deeplink path
-  manga <manga-url>           getMangaUpdate(details + chapters); an http(s) URL is resolved via `url` first
-  details <manga-url>         getMangaUpdate(fetchDetails only)
-  chapters <manga-url>        getMangaUpdate(fetchChapters only)
+  manga <manga-url> [title] [memo] [chapters]
+                              getMangaUpdate(details + chapters); an http(s) URL is resolved via `url` first.
+                               What the app's stored manga has: a title (sources that read manga.title need it
+                               when the url is a path), a memo JSON object, the stored chapters as a JSON array
+                               ([{"url":..,"name":..}, ...]; default none). Each is told apart by its shape.
+  details <manga-url> [..]    getMangaUpdate(fetchDetails only): the library update with "update metadata" on
+  chapters <manga-url> [..]   getMangaUpdate(fetchChapters only): library update, deep link, migration
   pages <chapter-url> [memo]  getPageList; a full URL on baseUrl is reduced to its path; memo = the chapter's memo JSON.
                                --images N: then load the first N images as the reader does (as smoke's pages step;
                                written to EXT_RUN_SAVE_IMAGES when set, which alone loads 2)
   filters [--fetch]           print getFilterList() (after any --filter); --fetch waits for fetchFilterData first
-  related <manga-url>         fetchRelatedMangaList (Komikku related manga)
+  related <manga-url> [title] [memo]
+                              fetchRelatedMangaList (Komikku related manga) on the stored manga (title, memo as for manga)
+  covers <popular|latest|search q|url u|manga url> [--images N]
+                              the listing (or manga) as usual, then its first N (default 3) thumbnail_url loaded the
+                               way the app's cover loader does (the source's client and headers)
+  sync <manga-url> [state | read|unread <chapter-url>... | favorite|unfavorite]
+                              SyncableSource (proposed API): getSyncState, setChaptersRead, setFavorite
   sources                     list the sources the class provides
   browse [url]                open url (default baseUrl) in a WebView and hold it for `ext-run cdp <token> ...` until
                                `ext-run resume <token>`: log in / pass checks; cookies kept with --cookies FILE
@@ -165,6 +176,7 @@ fun main(args: Array<String>) {
     }
     CfClearances.load()
     HarnessCookieJar.load()
+    WebStorage.load()
 
     val t0 = System.nanoTime()
     val code = try {
@@ -192,6 +204,8 @@ fun main(args: Array<String>) {
     if (FixtureServer.started) System.err.println(FixtureServer.summary())
     WebViewBridge.pullCookies()
     HarnessCookieJar.save()
+    WebViewBridge.pullStorage()
+    WebStorage.save()
     WebViewBridge.shutdown()
     System.out.flush()
     exitProcess(code)
@@ -246,8 +260,9 @@ private suspend fun run(source: Source, all: List<Source>, o: Opts): Int {
         "search" -> printPage(o, source.getSearchManga(page(2), arg(1), buildFilters(source, o)))
         "url" -> printPage(o, source.getSearchManga(page(2), arg(1), source.getFilterList()))
         "manga", "details", "chapters" -> {
-            val manga = resolveManga(source, arg(1))
-            val update = source.getMangaUpdate(manga, emptyList(), cmd != "chapters", cmd != "details")
+            val stored = storedManga(cmd, args.drop(2))
+            val manga = stored.applyTo(resolveManga(source, arg(1)))
+            val update = withTitleHint(cmd) { source.getMangaUpdate(manga, stored.chapters, cmd != "chapters", cmd != "details") }
             printManga(o, update.manga, update.chapters.takeIf { cmd != "details" })
         }
         "pages" -> {
@@ -272,9 +287,12 @@ private suspend fun run(source: Source, all: List<Source>, o: Opts): Int {
             printFilters(o, buildFilters(source, o))
         }
         "related" -> {
-            val manga = resolveManga(source, arg(1))
-            printPage(o, MangasPage((source as CatalogueSource).fetchRelatedMangaList(manga), false))
+            val stored = storedManga(cmd, args.drop(2))
+            val manga = stored.applyTo(resolveManga(source, arg(1)))
+            printPage(o, MangasPage(withTitleHint(cmd) { (source as CatalogueSource).fetchRelatedMangaList(manga) }, false))
         }
+        "covers" -> return covers(source, o, args.drop(1))
+        "sync" -> return sync(source, o, args.drop(1))
         "smoke" -> return runSmoke(source, args.getOrNull(1))
         "browse" -> return browse(source, args.getOrNull(1))
         else -> die("unknown command '$cmd'\n$USAGE")
@@ -301,7 +319,7 @@ private fun browse(source: Source, urlArg: String?): Int {
         }
     }.get()
     if (System.getenv("EXT_RUN_COOKIES").isNullOrEmpty()) {
-        System.err.println("  ! browse without --cookies FILE: only cf_clearance is kept after this run, a login is lost")
+        System.err.println("  ! browse without --cookies FILE: only cf_clearance is kept after this run, a login (cookies, localStorage) is lost")
     }
     val hold = Hold.announce(view, "browse: log in or pass the site's checks, then resume")
     Hold.await(hold)
@@ -313,11 +331,14 @@ private fun browse(source: Source, urlArg: String?): Int {
     kept.groupBy { it.domain }.toSortedMap().forEach { (domain, cs) ->
         System.err.println("cookies: $domain: ${cs.map { it.name }.distinct().sorted().joinToString(", ")}")
     }
+    WebStorage.snapshot().toSortedMap().forEach { (origin, items) ->
+        if ((items as JsonObject).isNotEmpty()) System.err.println("localStorage: $origin: ${items.keys.sorted().joinToString(", ")}")
+    }
     System.err.println(
         if (System.getenv("EXT_RUN_COOKIES").isNullOrEmpty()) {
-            "browse: done; cf_clearance (if any) is kept for this exit, other cookies are dropped"
+            "browse: done; cf_clearance (if any) is kept for this exit, other cookies and localStorage are dropped"
         } else {
-            "browse: done; ${kept.size} cookie(s) kept: run with the same --cookies FILE (and VPN exit) to use them"
+            "browse: done; ${kept.size} cookie(s) and localStorage kept: run with the same --cookies FILE to use them"
         },
     )
     return 0
@@ -456,6 +477,58 @@ private fun stripBase(source: Source, u: String): String {
     // Only on a boundary: https://site.com must not eat the start of https://site.com.cdn/...
     val rest = u.removePrefix(base).takeIf { it != u } ?: return u
     return if (rest.isEmpty() || rest[0] in "/?#") rest.ifEmpty { "/" } else u
+}
+
+/** What the app has stored for a manga besides its url: `manga <url> [title] [memo] [chapters]`, told apart by shape. */
+private class StoredManga(val title: String?, val memo: JsonObject?, val chapters: List<SChapter>) {
+    fun applyTo(m: SManga): SManga = m.apply {
+        this@StoredManga.title?.let { title = it }
+        this@StoredManga.memo?.let { memo = it }
+    }
+}
+
+private fun storedManga(cmd: String, extra: List<String>): StoredManga {
+    var title: String? = null
+    var memo: JsonObject? = null
+    var chapters: List<SChapter> = emptyList()
+    for (a in extra) {
+        val json = a.trimStart().takeIf { it.startsWith("{") || it.startsWith("[") }?.let {
+            runCatching { Json.parseToJsonElement(a) }.getOrElse { die("$cmd: '$a' isn't valid JSON (a memo object or a chapter array)") }
+        }
+        when (json) {
+            is JsonObject -> memo = json
+            is JsonArray -> chapters = json.mapIndexed { i, e ->
+                val c = e as? JsonObject ?: die("$cmd: chapter #${i + 1} isn't an object")
+                fun str(k: String) = (c[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
+                SChapter.create().apply {
+                    url = str("url") ?: die("$cmd: chapter #${i + 1} has no url")
+                    name = str("name") ?: url
+                    (c["chapter_number"] as? JsonPrimitive)?.content?.toFloatOrNull()?.let { chapter_number = it }
+                    scanlator = str("scanlator")
+                    (c["date_upload"] as? JsonPrimitive)?.content?.toLongOrNull()?.let { date_upload = it }
+                    (c["memo"] as? JsonObject)?.let { this.memo = it }
+                }
+            }
+            else -> if (title == null) title = a else die("$cmd: two titles given ('$title', '$a')")
+        }
+    }
+    return StoredManga(title, memo, chapters)
+}
+
+/**
+ * Runs [block], turning an unset manga.title into a hint: the app's stored manga always has its title (from browse,
+ * search or the deep link), a bare path here doesn't.
+ */
+private inline fun <T> withTitleHint(cmd: String, block: () -> T): T = try {
+    block()
+} catch (e: UninitializedPropertyAccessException) {
+    if (e.message?.contains("title") == true) {
+        System.err.println(
+            "ext-run: the source reads manga.title, which the app always has; give it: `$cmd <url> 'The Title'`, " +
+                "or pass the full http(s) URL so URL search finds the entry",
+        )
+    }
+    throw e
 }
 
 // An http(s) URL goes through URL search and keeps the SManga it returns (memo included), as the app does.
@@ -798,6 +871,10 @@ private val KNOWN_COMICS = listOf(
     "Oshi no Ko", "Nano Machine", "The Greatest Estate Developer",
 )
 
+/** smoke's picks (search query, titles to open): EXT_RUN_SEED makes them repeatable (compare sets one seed for both sides). */
+private val smokeRandom: kotlin.random.Random =
+    System.getenv("EXT_RUN_SEED")?.toLongOrNull()?.let { kotlin.random.Random(it) } ?: kotlin.random.Random
+
 /** First two to three words of a title, enough to search with and loose enough to survive punctuation. */
 private fun searchWords(title: String): String =
     title.split(Regex("[^\\p{L}\\p{N}']+")).filter { it.isNotBlank() }.take(3).joinToString(" ").ifBlank { title }
@@ -922,7 +999,7 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
     // title from the source's own list should find something (a warning, not a failure).
     val searchMangas = mutableListOf<SManga>()
     smokeStep(source, "search", steps) { s ->
-        val known = KNOWN_COMICS.random()
+        val known = KNOWN_COMICS.random(smokeRandom)
         val knownHits = try {
             source.getSearchManga(1, known, source.getFilterList()).mangas
         } catch (e: UnsupportedOperationException) {
@@ -954,7 +1031,7 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
             listOf(listing?.firstOrNull { safe { it.url } == resolved.url } ?: resolved)
         }
         // A different series each run, so repeated runs cover more of the source.
-        listing != null -> listing.filter { safe { it.url } != null }.distinctBy { it.url }.shuffled().take(3)
+        listing != null -> listing.filter { safe { it.url } != null }.distinctBy { it.url }.shuffled(smokeRandom).take(3)
         else -> emptyList()
     }
     val noTitle = "no title to open: browse, latest and search all failed or returned nothing"
@@ -1005,7 +1082,7 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
             // listed there because a chapter just came out.
             val fromLatest = if (mangaArg == null && listingName != "latest") {
                 latestMangas.orEmpty().filter { safe { it.url } != null }.distinctBy { it.url }
-                    .filter { l -> first.none { safe { it.url } == l.url } }.shuffled().take(3)
+                    .filter { l -> first.none { safe { it.url } == l.url } }.shuffled(smokeRandom).take(3)
             } else {
                 emptyList()
             }
@@ -1111,6 +1188,148 @@ private suspend fun runSmoke(source: Source, mangaArg: String?): Int {
     }
 
     return finish()
+}
+
+// ---------- covers: thumbnails as the app's cover loader fetches them ----------
+
+/**
+ * `covers <listing command> [args]`: the entries a listing (or `manga <url>` after details) gives, then the first
+ * N thumbnail_url values loaded as Mihon's MangaCoverFetcher does: GET with the source's headers on the source's
+ * client (its interceptors), a non-2xx response failing the cover. Exit 1 if any cover failed.
+ */
+private suspend fun covers(source: Source, o: Opts, args: List<String>): Int {
+    val inner = args.firstOrNull() ?: die("covers: give a listing: covers popular|latest|search <q>|url <u>|manga <url>")
+    fun arg(n: Int) = args.getOrNull(n) ?: die("covers $inner: missing argument #$n")
+    fun page(n: Int) = o.page ?: args.getOrNull(n)?.toInt() ?: 1
+    val mangas: List<SManga> = when (inner) {
+        "popular" -> source.getPopularManga(page(1)).mangas
+        "latest" -> source.getLatestUpdates(page(1)).mangas
+        "search" -> source.getSearchManga(page(2), arg(1), buildFilters(source, o)).mangas
+        "url" -> source.getSearchManga(page(2), arg(1), source.getFilterList()).mangas
+        "manga", "details" -> {
+            val stored = storedManga("covers", args.drop(2))
+            val manga = stored.applyTo(resolveManga(source, arg(1)))
+            listOf(withTitleHint("covers manga") { source.getMangaUpdate(manga, stored.chapters, true, false) }.manga)
+        }
+        else -> die("covers: '$inner' isn't a listing (popular, latest, search, url, manga)")
+    }
+    val http = source as? HttpSource
+    val client = http?.client ?: Injekt.get<NetworkHelper>().client
+    var failed = 0
+    val n = o.images ?: 3
+    val picked = mangas.filter { !it.thumbnail_url.isNullOrBlank() }.take(n)
+    val results = picked.map { m ->
+        val url = m.thumbnail_url!!
+        buildJsonObject {
+            put("title", safe { m.title })
+            put("thumbnail_url", url)
+            try {
+                val request = okhttp3.Request.Builder().url(url).apply { http?.headers?.let { headers(it) } }.build()
+                client.newCall(request).await().use { r ->
+                    put("status", r.code)
+                    if (r.request.url.toString() != url) put("finalUrl", r.request.url.toString())
+                    if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code}")
+                    val bytes = r.body.bytes()
+                    put("bytes", bytes.size)
+                    put("contentType", r.body.contentType()?.toString())
+                    describeImage(bytes).forEach { (k, v) -> put(k, v) }
+                }
+            } catch (e: Exception) {
+                failed++
+                put("error", "${e::class.simpleName}: ${e.message}")
+            }
+        }
+    }
+    emit(o, buildJsonObject {
+        put("entries", mangas.size)
+        put("withThumbnail", mangas.count { !it.thumbnail_url.isNullOrBlank() })
+        put("failed", failed)
+        put("covers", JsonArray(results))
+    }) {
+        buildString {
+            appendLine("${mangas.size} entries, ${mangas.count { !it.thumbnail_url.isNullOrBlank() }} with a thumbnail; loaded ${results.size}, $failed failed")
+            results.forEach { c ->
+                fun f(k: String) = (c[k] as? JsonPrimitive)?.content
+                appendLine("  ${f("title")}\n     ${f("thumbnail_url")}")
+                appendLine("     " + (f("error")?.let { "FAILED: $it" } ?: "${f("status")} ${f("bytes")} bytes ${f("format")} ${f("width")}x${f("height")}"))
+            }
+        }.trimEnd()
+    }
+    if (picked.isEmpty()) System.err.println("covers: no entry has a thumbnail_url")
+    return if (failed > 0 || picked.isEmpty()) 1 else 0
+}
+
+/** Format and size of image [bytes], as far as the JVM can decode them (AVIF/HEIF and odd WebP by header only). */
+private fun describeImage(bytes: ByteArray): Map<String, JsonPrimitive> {
+    if (bytes.size >= 12) {
+        val brand = bytes.copyOfRange(4, 12).toString(Charsets.ISO_8859_1)
+        if (brand.startsWith("ftyp") && brand.substring(4) in setOf("avif", "avis", "heic", "heix", "mif1")) {
+            return mapOf("format" to JsonPrimitive("${brand.substring(4)} (signature only, not decoded)"))
+        }
+    }
+    val iis = ImageIO.createImageInputStream(ByteArrayInputStream(bytes))
+    val reader = ImageIO.getImageReaders(iis).asSequence().firstOrNull()
+    return try {
+        reader?.let { it.input = iis; it.read(0).let { img -> mapOf("format" to JsonPrimitive(it.formatName), "width" to JsonPrimitive(img.width), "height" to JsonPrimitive(img.height)) } }
+            ?: throw IllegalStateException("${bytes.size} bytes don't decode as an image")
+    } catch (e: Exception) {
+        webpSize(bytes)?.let { (w, h) -> mapOf("format" to JsonPrimitive("webp (header only)"), "width" to JsonPrimitive(w), "height" to JsonPrimitive(h)) }
+            ?: throw e
+    } finally {
+        reader?.dispose()
+    }
+}
+
+// ---------- sync: the proposed SyncableSource API (hazptr/extensions-lib), called by name ----------
+
+/** Calls the suspend method [name] of [target] with [args] (the continuation appended), by reflection. */
+private suspend fun callSuspend(target: Any, name: String, vararg args: Any?): Any? {
+    val m = target.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == args.size + 1 }
+        ?: die("sync: ${target.javaClass.simpleName} has no $name (not a SyncableSource, or the API changed)")
+    return kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn { cont ->
+        try {
+            m.invoke(target, *args, cont)
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            throw e.targetException
+        }
+    }
+}
+
+/** The getters of a result object (a SyncState), as JSON. */
+private fun gettersJson(v: Any?): JsonElement = when (v) {
+    null -> kotlinx.serialization.json.JsonNull
+    is Boolean -> JsonPrimitive(v)
+    is Number -> JsonPrimitive(v)
+    is String -> JsonPrimitive(v)
+    is Iterable<*> -> JsonArray(v.map(::gettersJson))
+    else -> buildJsonObject {
+        v.javaClass.methods.filter { it.parameterCount == 0 && it.name.startsWith("get") && it.name != "getClass" && it.declaringClass != Any::class.java }
+            .sortedBy { it.name }
+            .forEach { put(it.name.removePrefix("get").replaceFirstChar(Char::lowercase), gettersJson(it.invoke(v))) }
+    }
+}
+
+private suspend fun sync(source: Source, o: Opts, args: List<String>): Int {
+    val mangaUrl = args.firstOrNull() ?: die("sync: give a manga url")
+    val manga = resolveManga(source, mangaUrl)
+    when (val action = args.getOrNull(1) ?: "state") {
+        "state" -> Unit
+        "read", "unread" -> {
+            val urls = args.drop(2).ifEmpty { die("sync $action: give the chapter url(s)") }
+            val chapters = urls.map { u -> SChapter.create().apply { url = stripBase(source, u); name = url } }
+            callSuspend(source, "setChaptersRead", manga, chapters, action == "read")
+            System.err.println("sync: setChaptersRead(${chapters.size} chapter(s), read=${action == "read"}) returned")
+        }
+        "favorite", "unfavorite" -> {
+            callSuspend(source, "setFavorite", manga, action == "favorite")
+            System.err.println("sync: setFavorite(${action == "favorite"}) returned")
+        }
+        else -> die("sync: unknown action '$action' (state, read, unread, favorite, unfavorite)")
+    }
+    val state = withTitleHint("sync") { callSuspend(source, "getSyncState", manga) }
+    val json = gettersJson(state)
+    emit(o, json) { "sync state: " + pretty.encodeToString(JsonElement.serializer(), json) }
+    return 0
 }
 
 /** The first [count] pages' images through source.client, as the reader (HttpPageLoader) loads them; throws on a bad one. */

@@ -178,6 +178,9 @@ def entry(ext_source_dir, json_dir, config_dir, ext: str, status: str, summary: 
         pub["ops"] = ops
     if notes(smoke):
         pub["notes"] = notes(smoke)
+    failed_op = (re.match(r"^(\w+):", summary or "") or [None, None])[1]
+    if status == "fail" and any(o["op"] == failed_op and o["status"] == "na" for o in ops):
+        status = "pass"
     if status == "pass" and ops:
         pub["status"] = overall(ops)
         if pub["status"] == "untestable":

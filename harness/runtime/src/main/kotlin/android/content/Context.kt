@@ -14,12 +14,14 @@ abstract class Context {
 
     open fun getSystemService(name: String): Any? = when (name) {
         ACTIVITY_SERVICE -> android.app.ActivityManager()
+        DISPLAY_SERVICE -> android.hardware.display.DisplayManager.instance
         else -> null
     }
 
     @Suppress("UNCHECKED_CAST")
     open fun <T> getSystemService(serviceClass: Class<T>): T? = when (serviceClass) {
         android.app.ActivityManager::class.java -> android.app.ActivityManager() as T
+        android.hardware.display.DisplayManager::class.java -> android.hardware.display.DisplayManager.instance as T
         else -> null
     }
 
@@ -35,5 +37,6 @@ abstract class Context {
     companion object {
         const val MODE_PRIVATE = 0
         const val ACTIVITY_SERVICE = "activity"
+        const val DISPLAY_SERVICE = "display"
     }
 }

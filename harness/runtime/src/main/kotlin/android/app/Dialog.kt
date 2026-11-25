@@ -46,6 +46,11 @@ open class Dialog @JvmOverloads constructor(
         window.setContentView(view)
     }
 
+    open fun setContentView(view: View, params: android.view.ViewGroup.LayoutParams?) {
+        contentView = view
+        if (params != null) window.setContentView(view, params) else window.setContentView(view)
+    }
+
     // Nobody presses back or taps outside in ext-run
     open fun setCancelable(flag: Boolean) {}
     open fun setCanceledOnTouchOutside(cancel: Boolean) {}

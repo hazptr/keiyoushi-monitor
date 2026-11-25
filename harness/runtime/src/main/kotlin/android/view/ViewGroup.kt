@@ -5,6 +5,17 @@ import android.content.Context
 /** android.view.ViewGroup: children with their layout params. A view is in at most one parent, as on Android. */
 abstract class ViewGroup @JvmOverloads constructor(context: Context?, attrs: Any? = null) : View(context, attrs), ViewParent {
     private val children = ArrayList<View>()
+    private var hierarchyListener: OnHierarchyChangeListener? = null
+
+    /** Told when a child is added or removed, as on Android. */
+    interface OnHierarchyChangeListener {
+        fun onChildViewAdded(parent: View, child: View)
+        fun onChildViewRemoved(parent: View, child: View)
+    }
+
+    open fun setOnHierarchyChangeListener(listener: OnHierarchyChangeListener?) {
+        hierarchyListener = listener
+    }
 
     open fun addView(child: View) = addView(child, -1)
 
@@ -23,17 +34,25 @@ abstract class ViewGroup @JvmOverloads constructor(context: Context?, attrs: Any
         child.setLayoutParams(params)
         if (index < 0) children.add(child) else children.add(index, child)
         child.mParent = this
+        hierarchyListener?.onChildViewAdded(this, child)
     }
 
     open fun removeView(view: View) {
-        if (children.remove(view)) view.mParent = null
+        if (children.remove(view)) {
+            view.mParent = null
+            hierarchyListener?.onChildViewRemoved(this, view)
+        }
     }
 
     open fun removeViewAt(index: Int) = removeView(children[index])
 
     open fun removeAllViews() {
-        children.forEach { it.mParent = null }
+        val removed = children.toList()
         children.clear()
+        removed.forEach {
+            it.mParent = null
+            hierarchyListener?.onChildViewRemoved(this, it)
+        }
     }
 
     open fun getChildCount(): Int = children.size

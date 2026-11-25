@@ -5,7 +5,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
-/** Handler on the main looper (the only one). Messages aren't supported, Runnables are. */
+/** Handler on a [Looper] (the main one or a HandlerThread's). Messages aren't supported, Runnables are. */
 open class Handler @JvmOverloads constructor(
     private val looper: Looper = Looper.myLooper() ?: throw RuntimeException("Can't create handler inside thread that has not called Looper.prepare()"),
 ) {
@@ -22,14 +22,18 @@ open class Handler @JvmOverloads constructor(
         val holder = arrayOfNulls<ScheduledFuture<*>>(1)
         // Held while scheduling so a zero-delay task can't run before its future is recorded.
         synchronized(holder) {
-            holder[0] = MainThread.executor.schedule(
-                {
-                    synchronized(holder) { set.remove(holder[0]) }
-                    MainThread.guard(r).run()
-                },
-                delayMillis.coerceAtLeast(0),
-                TimeUnit.MILLISECONDS,
-            )
+            holder[0] = try {
+                looper.executor.schedule(
+                    {
+                        synchronized(holder) { set.remove(holder[0]) }
+                        MainThread.guard(r).run()
+                    },
+                    delayMillis.coerceAtLeast(0),
+                    TimeUnit.MILLISECONDS,
+                )
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                return false // the looper has quit, as Android's post() reports
+            }
             set.add(holder[0]!!)
         }
         return true
